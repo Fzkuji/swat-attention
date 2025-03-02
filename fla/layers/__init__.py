@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+from .swat_attn import SWATAttention
 from .abc import ABCAttention
 from .attn import Attention
 from .based import BasedLinearAttention
@@ -18,6 +19,7 @@ from .rwkv6 import RWKV6Attention
 from .rwkv7 import RWKV7Attention
 
 __all__ = [
+    'SWATAttention',
     'ABCAttention',
     'Attention',
     'BasedLinearAttention',

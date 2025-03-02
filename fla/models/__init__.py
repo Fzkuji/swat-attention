@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+from fla.models.swat import SWATConfig, SWATForCausalLM, SWATModel
 from fla.models.abc import ABCConfig, ABCForCausalLM, ABCModel
 from fla.models.bitnet import BitNetConfig, BitNetForCausalLM, BitNetModel
 from fla.models.delta_net import (DeltaNetConfig, DeltaNetForCausalLM,
@@ -26,6 +27,7 @@ from fla.models.transformer import (TransformerConfig, TransformerForCausalLM,
                                     TransformerModel)
 
 __all__ = [
+    'SWATConfig', 'SWATForCausalLM', 'SWATModel',
     'ABCConfig', 'ABCForCausalLM', 'ABCModel',
     'BitNetConfig', 'BitNetForCausalLM', 'BitNetModel',
     'DeltaNetConfig', 'DeltaNetForCausalLM', 'DeltaNetModel',
