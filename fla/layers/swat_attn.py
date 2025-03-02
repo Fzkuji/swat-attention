@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from fla.models.utils import Cache
 
 try:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_sigmoid import flash_attn_func as flash_sigmoid_func
     from flash_attn.bert_padding import (index_first_axis, pad_input,
                                          unpad_input)
 except ImportError:
@@ -30,6 +30,13 @@ except ImportError:
     flash_attn_func = None
 
 logger = logging.get_logger(__name__)
+
+
+def get_alibi_slope(num_heads):
+   x = (2 ** 8) ** (1 / num_heads)
+   return (
+       torch.tensor([ -1 / x ** (i + 1) for i in range(num_heads)])
+   )
 
 
 class SWATAttention(nn.Module):
@@ -123,40 +130,16 @@ class SWATAttention(nn.Module):
                 k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
                 v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
 
-        if flash_attn_func is None:
-            raise ImportError("Please install Flash Attention via `pip install flash-attn --no-build-isolation` first")
+        if flash_sigmoid_func is None:
+            raise ImportError("Please install Sigmoid Attention first")
 
         # Contains at least one padding token in the sequence
-        if attention_mask is not None:
-            q, k, v, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(q, k, v, attention_mask, q_len)
-            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-            max_seqlen_q, max_seqlen_k = max_seq_lens
-            o = flash_attn_varlen_func(
-                q, k, v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                causal=True,
-                window_size=(-1, -1) if self.window_size is None else (self.window_size-1, 0)
-            )
-            o = pad_input(o, indices_q, batch_size, q_len)
-        elif cu_seqlens is not None:
-            o = flash_attn_varlen_func(
-                q.squeeze(0), k.squeeze(0), v.squeeze(0),
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                causal=True,
-                window_size=(-1, -1) if self.window_size is None else (self.window_size-1, 0)
-            ).unsqueeze(0)
-        else:
-            o = flash_attn_func(
-                q, k, v,
-                causal=True,
-                window_size=(-1, -1) if self.window_size is None else (self.window_size-1, 0)
-            )
+        o = flash_sigmoid_func(
+            q, k, v,
+            causal=True,
+            window_size=(-1, -1) if self.window_size is None else (self.window_size-1, 0),
+            alibi_slopes=get_alibi_slope(self.num_heads).to(q.device),
+        )
         o = o.reshape(batch_size, q_len, -1)
         o = self.o_proj(o)
 
