@@ -15,7 +15,7 @@ from transformers.modeling_outputs import (BaseModelOutputWithPast,
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
-from fla.layers.attn import Attention
+from fla.layers.swat_attn import SWATAttention
 from fla.models.swat.configuration_swat import SWATConfig
 from fla.models.utils import Cache
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss
@@ -38,7 +38,7 @@ class SWATBlock(nn.Module):
         self.layer_idx = layer_idx
 
         self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
-        self.attn = Attention(
+        self.attn = SWATAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_heads,
             num_kv_heads=config.num_kv_heads,

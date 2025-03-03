@@ -33,10 +33,10 @@ logger = logging.get_logger(__name__)
 
 
 def get_alibi_slope(num_heads):
-   x = (2 ** 8) ** (1 / num_heads)
-   return (
-       torch.tensor([ -1 / x ** (i + 1) for i in range(num_heads)])
-   )
+    x = (2 ** 8) ** (1 / num_heads)
+    return (
+        torch.tensor([ 1 / x ** (i + 1) for i in range(num_heads)])
+    )
 
 
 class SWATAttention(nn.Module):
