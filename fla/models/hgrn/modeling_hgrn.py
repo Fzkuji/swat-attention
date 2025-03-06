@@ -327,8 +327,8 @@ class HGRNForCausalLM(HGRNPreTrainedModel, GenerationMixin):
         num_logits_to_keep: Optional[int] = None,
         **kwargs: Unpack[Dict]
     ):
-        # only last token for `inputs_ids` if the `past_key_values` is passed along.
-        if past_key_values is not None:
+        # only last token for `inputs_ids` if the `past_key_values` is not empty.
+        if past_key_values is not None and len(past_key_values) > 0:
             input_ids = input_ids[:, -1:]
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and len(past_key_values) == 0:
