@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+from .swattn import SWAttention
 from .abc import ABCAttention
 from .attn import Attention
 from .based import BasedLinearAttention
@@ -29,6 +30,7 @@ from .rwkv6 import RWKV6Attention
 from .rwkv7 import RWKV7Attention
 
 __all__ = [
+    'SWAttention',
     'ABCAttention',
     'Attention',
     'BasedLinearAttention',

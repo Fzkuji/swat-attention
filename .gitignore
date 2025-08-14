@@ -42,3 +42,6 @@ __pycache__
 
 # macOS
 .DS_Store
+
+# pycharm
+.idea

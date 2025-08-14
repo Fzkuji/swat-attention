@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from fla.layers import (
+    SWAttention,
     ABCAttention,
     Attention,
     BasedLinearAttention,
@@ -26,6 +27,8 @@ from fla.layers import (
     RWKV7Attention
 )
 from fla.models import (
+    SWATModel,
+    SWATForCausalLM,
     ABCForCausalLM,
     ABCModel,
     BitNetForCausalLM,
@@ -71,6 +74,7 @@ from fla.models import (
 )
 
 __all__ = [
+    'SWAttention', 'SWATForCausalLM', 'SWATModel',
     'ABCAttention', 'ABCForCausalLM', 'ABCModel',
     'Attention', 'TransformerForCausalLM', 'TransformerModel',
     'BasedLinearAttention',

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+from fla.models.swat import SWATConfig, SWATForCausalLM, SWATModel
 from fla.models.abc import ABCConfig, ABCForCausalLM, ABCModel
 from fla.models.bitnet import BitNetConfig, BitNetForCausalLM, BitNetModel
 from fla.models.comba import CombaConfig, CombaForCausalLM, CombaModel
@@ -31,6 +32,7 @@ from fla.models.samba import SambaConfig, SambaForCausalLM, SambaModel
 from fla.models.transformer import TransformerConfig, TransformerForCausalLM, TransformerModel
 
 __all__ = [
+    'SWATConfig', 'SWATForCausalLM', 'SWATModel',
     'ABCConfig', 'ABCForCausalLM', 'ABCModel',
     'BitNetConfig', 'BitNetForCausalLM', 'BitNetModel',
     'CombaConfig', 'CombaForCausalLM', 'CombaModel',
