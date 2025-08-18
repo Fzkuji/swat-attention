@@ -159,6 +159,11 @@ class SWAttention(nn.Module):
             causal_mask = attention_mask[:, :, :, :k.shape[-2]]
             attn_weights = attn_weights + causal_mask
         
+        # sink latest token - add bias to diagonal (assuming q_len == k_len)
+        seq_len = q.size(-2)
+        # Use stride trick to directly modify diagonal elements
+        attn_weights.view(attn_weights.shape[0], attn_weights.shape[1], -1)[:, :, ::seq_len+1] += 10
+
         # Apply softmax with float32 for numerical stability
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
 
