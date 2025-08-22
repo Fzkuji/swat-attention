@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from transformers.generation import GenerationMixin
-from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
@@ -221,20 +220,6 @@ class SWATModel(SWATPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_attns = () if output_attentions else None
         next_cache = None
-
-        if attention_mask is None:
-            # Prepare 4D causal attention mask
-            batch_size, seq_length = inputs_embeds.shape[:2]
-            past_key_values_length = past_key_values.get_seq_length() if past_key_values is not None else 0
-
-            # Create causal mask with sliding window support
-            attention_mask = _prepare_4d_causal_attention_mask(
-                attention_mask,
-                (batch_size, seq_length),
-                inputs_embeds,
-                past_key_values_length,
-                sliding_window=self.config.window_size
-            )
 
         for layer in self.layers:
             if output_hidden_states:
