@@ -30,6 +30,142 @@ except ImportError:
 logger = logging.get_logger(__name__)
 
 
+def get_alibi_slope(num_heads):
+    x = (2 ** 8) ** (1 / num_heads)
+    return (
+        torch.tensor([ 1 / x ** (i + 1) for i in range(num_heads)])
+    )
+
+
+# def get_alibi_slope(num_heads):
+#     # 正值部分的斜率：衰减得快
+#     pos_heads = int(num_heads * 3 / 4)
+
+#     x_pos = (2 ** 8) ** (1 / num_heads)
+#     pos_slopes = torch.tensor([1 / x_pos ** (i + 1) for i in range(pos_heads)])
+
+#     # 负值部分的斜率：衰减得慢
+#     neg_heads = num_heads - pos_heads
+
+#     x_neg = (2 ** 8) ** (1 / num_heads)
+#     neg_slopes = torch.tensor([-1 / x_neg ** (i + 1) for i in range(neg_heads)])
+
+#     # 拼接正负 slope，形成不对称结构
+#     full_slopes = torch.cat([pos_slopes, neg_slopes])
+
+#     return full_slopes
+
+# def get_alibi_slope(num_heads):
+#     pos_heads = num_heads // 2          # 4
+#     k = 10
+#     x_pos = (2 ** k) ** (1 / num_heads) # ≈ 1.6726
+
+#     # 0.018997257 是 RoPE 的最大瞬时衰减斜率 s_max
+#     s_max = 1.8997257e-02
+#     pos_slopes = torch.tensor([s_max / x_pos ** i for i in range(pos_heads)])
+
+#     neg_slopes = -pos_slopes            # 保持对称
+#     return torch.cat([pos_slopes, neg_slopes.flip(0)]).to(torch.bfloat16)
+
+
+# def get_alibi_slope(num_heads):
+#     # 计算标准 ALiBi slopes (num_heads-2 个)
+#     n_alibi_heads = num_heads - 2
+#     x = (2 ** 8) ** (1 / n_alibi_heads)
+
+#     # 生成标准的 ALiBi slopes
+#     alibi_slopes = torch.tensor([1 / x ** (i + 1) for i in range(n_alibi_heads)])
+
+#     # 在开头添加 0，在末尾添加 2
+#     slopes = torch.cat([
+#         torch.tensor([0.0]),      # 第一个头使用 slope=0（无位置偏置）
+#         alibi_slopes,             # 中间的头使用标准 ALiBi slopes
+#         torch.tensor([2.0])       # 最后一个头使用 slope=2（强位置偏置）
+#     ])
+
+#     return slopes
+
+
+# def get_alibi_slope(num_heads):  # 48.01 16 heads   / 32 heads 2048 3.0517
+#     assert num_heads % 2 == 0, "num_heads 必须是偶数"
+#     n_half = num_heads // 2
+
+#     # 前一半：标准 ALiBi slope
+#     x = (2 ** 8) ** (1 / n_half)
+#     front_half = torch.tensor([2 / x ** (i + 1) for i in range(n_half)])
+
+#     # 后一半：固定值 + 补零
+#     fixed_values = [10, 8, 6.0, 4.0, 3.0, 2]
+#     back_half = torch.zeros(n_half)
+#     for i in range(n_half):
+#         if i < len(fixed_values):
+#             back_half[i] = fixed_values[i]
+#         else:
+#             back_half[i] = 0.0
+
+#     # 拼接成完整的 slope 向量
+#     slopes = torch.cat([front_half, back_half])
+#     return slopes
+
+
+# def get_alibi_slope(num_heads):  # 47.7925
+#     assert num_heads == 16, "当前函数只支持 num_heads=16"
+#     return torch.tensor([
+#         0.08, 0.04, 0.02, 0.01,
+#         0.005, 0.0025, -0.0025, 0,
+#         0, 0.16, 0.33, 1.0,
+#         14.0, 15.0, 16.0, 20.0
+#     ])
+
+
+# import torch
+
+# def get_alibi_slope(num_heads):
+#     assert num_heads % 2 == 0, "num_heads 必须是偶数"
+
+#     # 固定的后半部分 slope 值
+#     fixed_values = [10, 8, 6.0, 4.0, 3.0, 2, 0, 0, -0.05, -0.1]
+#     back_half = torch.tensor(fixed_values, dtype=torch.float32)
+
+#     # 前一半需要补多少
+#     num_front = num_heads - len(fixed_values)
+
+#     # 前一半 slope：对称指数增长
+#     x = (2 ** 8) ** (1 / num_front)
+
+#     front_half = torch.tensor(
+#         [x ** (i - num_front / 2) for i in range(num_front)],
+#         dtype=torch.float32
+#     )
+
+#     # 拼接为完整 slope 向量
+#     slopes = torch.cat([front_half, back_half])
+#     return slopes
+
+# import torch
+
+# def get_alibi_slope(num_heads):  # 3.0525 2048 16 heads
+#     assert num_heads % 2 == 0, "num_heads 必须是偶数"
+
+#     # 固定的后半部分 slope 值
+#     fixed_values = []
+#     back_half = torch.tensor(fixed_values, dtype=torch.float32)
+
+#     # 前一半需要补多少
+#     num_front = num_heads - len(fixed_values)
+
+#     # 前一半 slope：对称指数增长
+#     x = (2 ** 10) ** (1 / num_front)
+
+#     front_half = torch.tensor(
+#         [x ** (i - num_front / 2) for i in range(num_front)],
+#         dtype=torch.float32
+#     )
+
+#     # 拼接为完整 slope 向量
+#     slopes = torch.cat([back_half, front_half])
+#     return slopes
+
 class SWAttention(nn.Module):
 
     def __init__(
@@ -75,20 +211,7 @@ class SWAttention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim)
             self.k_norm = RMSNorm(self.head_dim)
 
-        # self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
-
-        rope_center_base = 150000.0
-        rope_scale_factor = 1.5
-
-        # 为每个head创建rotary
-        center = num_heads / 2.0
-        self.rotaries = nn.ModuleList([
-            RotaryEmbedding(
-                dim=self.head_dim,
-                base=rope_center_base * (rope_scale_factor ** (i + 0.5 - center))
-            )
-            for i in range(num_heads)
-        ])
+        self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
 
     def forward(
         self,
@@ -130,15 +253,7 @@ class SWAttention(nn.Module):
 
         if self.max_position_embeddings is not None:
             max_seqlen = max(max_seqlen, self.max_position_embeddings)
-        # q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen, cu_seqlens=cu_seqlens)
-        # 对每个head应用对应的rotary（原地修改）
-        for i, rotary in enumerate(self.rotaries):
-            q[:, :, i:i+1], k[:, :, i:i+1] = rotary(
-                q[:, :, i:i+1], k[:, :, i:i+1],
-                seqlen_offset=seqlen_offset,
-                max_seqlen=max_seqlen,
-                cu_seqlens=cu_seqlens
-            )
+        q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen, cu_seqlens=cu_seqlens)
 
         if past_key_values is not None:
             cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
@@ -167,7 +282,8 @@ class SWAttention(nn.Module):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
                 causal=True,
-                window_size=(-1, -1) if self.window_size is None else (self.window_size-1, 0)
+                window_size=(-1, -1) if self.window_size is None else (self.window_size-1, 0),
+                alibi_slopes=get_alibi_slope(self.num_heads).to(q.device),
             )
             o = pad_input(o, indices_q, batch_size, q_len)
         elif cu_seqlens is not None:
@@ -178,13 +294,15 @@ class SWAttention(nn.Module):
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
                 causal=True,
-                window_size=(-1, -1) if self.window_size is None else (self.window_size-1, 0)
+                window_size=(-1, -1) if self.window_size is None else (self.window_size-1, 0),
+                alibi_slopes=get_alibi_slope(self.num_heads).to(q.device),
             ).unsqueeze(0)
         else:
             o = flash_attn_func(
                 q, k, v,
                 causal=True,
-                window_size=(-1, -1) if self.window_size is None else (self.window_size-1, 0)
+                window_size=(-1, -1) if self.window_size is None else (self.window_size-1, 0),
+                alibi_slopes=get_alibi_slope(self.num_heads).to(q.device),
             )
         o = o.reshape(batch_size, q_len, -1)
         o = self.o_proj(o)
