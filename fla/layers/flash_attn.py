@@ -1,824 +1,725 @@
-import pytest
 import torch
-import torch.nn as nn
-import os
 
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
-
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
-
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-
-def is_cuda():
-    return triton.runtime.driver.active.get_current_target().backend == "cuda"
-
-
-def supports_host_descriptor():
-    return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
-
-
-def is_blackwell():
-    return is_cuda() and torch.cuda.get_device_capability()[0] == 10
-
-
-def is_hopper():
-    return is_cuda() and torch.cuda.get_device_capability()[0] == 9
 
 
 @triton.jit
-def _attn_fwd_inner(acc, l_i, m_i, q,  #
-                    desc_k, desc_v,  #
-                    offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
-                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
-                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
-                    N_CTX: tl.constexpr, warp_specialize: tl.constexpr, IS_HOPPER: tl.constexpr,
-                    rel_bias_ptr, bias_max_len: tl.constexpr, off_h: tl.constexpr):
+def _attn_fwd_inner(
+    O_block,
+    l_i,
+    m_i,
+    Q_block,
+    K_block_ptr,
+    V_block_ptr,
+    block_index_q,
+    softmax_scale,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+    STAGE: tl.constexpr,
+    offs_q: tl.constexpr,
+    offs_kv: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+):
     # range of values handled by this stage
     if STAGE == 1:
-        lo, hi = 0, start_m * BLOCK_M
+        # From 0 to the left of the diagonal
+        lo, hi = 0, block_index_q * BLOCK_SIZE_Q
     elif STAGE == 2:
-        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
-        lo = tl.multiple_of(lo, BLOCK_M)
-    # causal = False
+        # Used only for the block in which there is transition between non-masked and masked keys
+        lo, hi = block_index_q * BLOCK_SIZE_Q, (block_index_q + 1) * BLOCK_SIZE_Q
+        lo = tl.multiple_of(lo, BLOCK_SIZE_Q)
     else:
-        lo, hi = 0, N_CTX
-    offsetk_y = offset_y + lo
-    if dtype == tl.float8e5:
-        offsetv_y = offset_y * HEAD_DIM + lo
-    else:
-        offsetv_y = offset_y + lo
+        # Only used for non-causal attention
+        lo, hi = 0, SEQ_LEN
+
+    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+
     # loop over k, v and update accumulator
-    for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=warp_specialize):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
+    for start_kv in range(lo, hi, BLOCK_SIZE_KV):
+        # Just let the compiler know that start_n is a multiple of BLOCK_N, so the compiler can do optimizations
+        start_kv = tl.multiple_of(start_kv, BLOCK_SIZE_KV)
+
         # -- compute qk ----
-        k = desc_k.load([offsetk_y, 0]).T
-        qk = tl.dot(q, k)
-        
-        # Add relative position bias if provided
-        if rel_bias_ptr is not None:
-            # Calculate relative positions for this block
-            q_pos = start_m * BLOCK_M + offs_m
-            k_pos = start_n + offs_n
-            # Compute relative positions using broadcasting
-            rel_pos = q_pos[:, None] - k_pos[None, :]
-            # Clamp to bias range
-            rel_pos = tl.minimum(tl.maximum(rel_pos, -bias_max_len + 1), bias_max_len - 1)
-            # Convert to bias index (0-indexed)
-            bias_idx = rel_pos + bias_max_len - 1
-            # Load bias values for this head
-            bias_offset = off_h * (2 * bias_max_len - 1)
-            # Load the bias values - we need to gather from the bias table
-            bias_vals = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-            for i in range(BLOCK_M):
-                for j in range(BLOCK_N):
-                    idx = bias_idx[i, j]
-                    bias_vals[i, j] = tl.load(rel_bias_ptr + bias_offset + idx)
-            qk = qk + bias_vals
-        
+        K_block = tl.load(K_block_ptr)
+        QK_block = tl.dot(Q_block, K_block)
+
         if STAGE == 2:
-            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
-            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk -= m_ij[:, None]
+            mask = offs_q[:, None] >= (start_kv + offs_kv[None, :])
+            QK_block = QK_block * softmax_scale + tl.where(mask, 0, -1.0e6)
+            m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
+            QK_block -= m_ij[:, None]
         else:
-            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-            qk = qk * qk_scale - m_ij[:, None]
-        p = tl.math.exp2(qk)
-        # -- compute correction factor
-        alpha = tl.math.exp2(m_i - m_ij)
-        l_ij = tl.sum(p, 1)
-        # -- update output accumulator --
-        if not IS_HOPPER and warp_specialize and BLOCK_M == 128 and HEAD_DIM == 128:
-            BM: tl.constexpr = acc.shape[0]
-            BN: tl.constexpr = acc.shape[1]
-            acc0, acc1 = acc.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
-            acc0 = acc0 * alpha[:, None]
-            acc1 = acc1 * alpha[:, None]
-            acc = tl.join(acc0, acc1).permute(0, 2, 1).reshape([BM, BN])
-        else:
-            acc = acc * alpha[:, None]
-        # prepare p and v for the dot
-        if dtype == tl.float8e5:
-            v = desc_v.load([0, offsetv_y]).T
-        else:
-            v = desc_v.load([offsetv_y, 0])
-        p = p.to(dtype)
-        # note that this non transposed v for FP8 is only supported on Blackwell
-        acc = tl.dot(p, v, acc)
-        # update m_i and l_i
-        # place this at the end of the loop to reduce register pressure
+            # Compute the maximum value of qk or keep the old max value
+            m_ij = tl.maximum(m_i, tl.max(QK_block, 1) * softmax_scale)
+            QK_block = QK_block * softmax_scale - m_ij[:, None]
+
+        # Compute the exponential of each dot product, so now we are computing exp(qk_ij - m_ij)
+        P_block = tl.math.exp(QK_block)
+        # Compute the sum by rows of the attention scores
+        l_ij = tl.sum(P_block, 1)
+
+        # This is the correction factor for the previous l_i
+        alpha = tl.math.exp(m_i - m_ij)
+        # Apply the correction factor to the previous l_i and add the new l_ij
         l_i = l_i * alpha + l_ij
+
+        V_block = tl.load(V_block_ptr)
+        # Convert P_block to the same dtype as V_block
+        P_block = P_block.to(V_block.dtype)
+        # This computes the following: O_new = P x V + O_old * alpha
+        O_block = O_block * alpha[:, None]
+        O_block = tl.dot(P_block, V_block, O_block)
+
         m_i = m_ij
-        offsetk_y += BLOCK_N
-        offsetv_y += BLOCK_N
-    return acc, l_i, m_i
+
+        # Move to the next block of K and V
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
+    return O_block, l_i, m_i
 
 
-def _host_descriptor_pre_hook(nargs):
-    BLOCK_M = nargs["BLOCK_M"]
-    BLOCK_N = nargs["BLOCK_N"]
-    HEAD_DIM = nargs["HEAD_DIM"]
-    if not isinstance(nargs["desc_q"], TensorDescriptor):
-        return
-    nargs["desc_q"].block_shape = [BLOCK_M, HEAD_DIM]
-    if nargs["FP8_OUTPUT"]:
-        nargs["desc_v"].block_shape = [HEAD_DIM, BLOCK_N]
-    else:
-        nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
-    nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
-    nargs["desc_o"].block_shape = [BLOCK_M, HEAD_DIM]
-
-
-if is_hip():
-    NUM_STAGES_OPTIONS = [1]
-elif supports_host_descriptor():
-    NUM_STAGES_OPTIONS = [2, 3, 4]
-else:
-    NUM_STAGES_OPTIONS = [2, 3, 4]
-
-configs = [
-    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w, pre_hook=_host_descriptor_pre_hook) \
-    for BM in [64, 128]\
-    for BN in [32, 64, 128]\
-    for s in NUM_STAGES_OPTIONS \
-    for w in [4, 8]\
-]
-if "PYTEST_VERSION" in os.environ:
-    # Use a single config in testing for reproducibility
-    configs = [
-        triton.Config(dict(BLOCK_M=128, BLOCK_N=64), num_stages=2, num_warps=4, pre_hook=_host_descriptor_pre_hook),
-    ]
-
-
-def keep(conf):
-    BLOCK_M = conf.kwargs["BLOCK_M"]
-    BLOCK_N = conf.kwargs["BLOCK_N"]
-    return not (is_cuda() and torch.cuda.get_device_capability()[0] == 9 and BLOCK_M * BLOCK_N < 128 * 128
-                and conf.num_warps == 8)
-
-
-def prune_invalid_configs(configs, named_args, **kwargs):
-    N_CTX = kwargs["N_CTX"]
-
-    # Filter out configs where BLOCK_M > N_CTX
-    return [conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX]
-
-
+@triton.autotune(
+    [
+        triton.Config(
+            {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+        for BLOCK_SIZE_Q in [64, 128]
+        for BLOCK_SIZE_KV in [32, 64]
+        for num_stages in ([3, 4, 7])
+        for num_warps in [2, 4]
+    ],
+    key=["SEQ_LEN", "HEAD_DIM"],
+)
 @triton.jit
-def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
-    if isinstance(desc_or_ptr, tl.tensor_descriptor):
-        return desc_or_ptr
-    else:
-        return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
+def _attn_fwd(
+    Q,  # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM
+    K,  # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM
+    V,  # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM
+    softmax_scale,
+    M,  # BATCH_SIZE, NUM_HEADS, SEQ_LEN
+    O,  # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM
+    stride_Q_batch,
+    stride_Q_head,
+    stride_Q_seq,
+    stride_Q_dim,
+    stride_K_batch,
+    stride_K_head,
+    stride_K_seq,
+    stride_K_dim,
+    stride_V_batch,
+    stride_V_head,
+    stride_V_seq,
+    stride_V_dim,
+    stride_O_batch,
+    stride_O_head,
+    stride_O_seq,
+    stride_O_dim,
+    BATCH_SIZE,
+    NUM_HEADS: tl.constexpr,
+    SEQ_LEN: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    tl.static_assert(BLOCK_SIZE_KV <= HEAD_DIM)
 
+    # This indicate which block in the sequence length to process
+    block_index_q = tl.program_id(0)
 
-@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
-                 prune_configs_by={'early_config_prune': prune_invalid_configs})
-@triton.jit
-def _attn_fwd(sm_scale, M,  #
-              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
-              HEAD_DIM: tl.constexpr,  #
-              BLOCK_M: tl.constexpr,  #
-              BLOCK_N: tl.constexpr,  #
-              FP8_OUTPUT: tl.constexpr,  #
-              STAGE: tl.constexpr,  #
-              warp_specialize: tl.constexpr,  #
-              IS_HOPPER: tl.constexpr,  #
-              rel_bias_ptr=None,  #
-              bias_max_len: tl.constexpr = 512,  #
-              ):
-    dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
-    start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
-    off_z = off_hz // H
-    off_h = off_hz % H
+    # This indicates which head and batch to process. Each program is associated with a single head of a single batch
+    index_batch_head = tl.program_id(1)
+    # This indicate which batch this program is associated with (each batch has NUM_HEADS heads)
+    index_batch = index_batch_head // NUM_HEADS
+    # This indicate the position of the head in the batch
+    index_head = index_batch_head % NUM_HEADS
 
-    y_dim = Z * H * N_CTX
-    desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_M, HEAD_DIM])
-    if FP8_OUTPUT:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim], strides=[N_CTX, 1],
-                                         block_shape=[HEAD_DIM, BLOCK_N])
-    else:
-        desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                         block_shape=[BLOCK_N, HEAD_DIM])
-    desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_N, HEAD_DIM])
-    desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_M, HEAD_DIM])
-
-    offset_y = off_z * (N_CTX * H) + off_h * N_CTX
-    qo_offset_y = offset_y + start_m * BLOCK_M
-    # initialize offsets
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    # initialize pointer to m and l
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    # load scales
-    qk_scale = sm_scale
-    qk_scale *= 1.44269504  # 1/log(2)
-    # load q: it will stay in SRAM throughout
-    q = desc_q.load([qo_offset_y, 0])
-    # stage 1: off-band
-    # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
-    # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
-    if STAGE & 1:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
-                                        desc_k, desc_v,  #
-                                        offset_y, dtype, start_m, qk_scale,  #
-                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        4 - STAGE, offs_m, offs_n, N_CTX,  #
-                                        warp_specialize, IS_HOPPER,
-                                        rel_bias_ptr, bias_max_len, off_h)
-    # stage 2: on-band
-    if STAGE & 2:
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
-                                        desc_k, desc_v,  #
-                                        offset_y, dtype, start_m, qk_scale,  #
-                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        2, offs_m, offs_n, N_CTX,  #
-                                        warp_specialize, IS_HOPPER,
-                                        rel_bias_ptr, bias_max_len, off_h)
-    # epilogue
-    m_i += tl.math.log2(l_i)
-    acc = acc / l_i[:, None]
-    m_ptrs = M + off_hz * N_CTX + offs_m
-    tl.store(m_ptrs, m_i)
-    desc_o.store([qo_offset_y, 0], acc.to(dtype))
-
-
-@triton.jit
-def _attn_bwd_preprocess(O, DO,  #
-                         Delta,  #
-                         Z, H, N_CTX,  #
-                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr  #
-                         ):
-    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    off_hz = tl.program_id(1)
-    off_n = tl.arange(0, HEAD_DIM)
-    # load
-    o = tl.load(O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :])
-    do = tl.load(DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
-    delta = tl.sum(o * do, axis=1)
-    # write-back
-    tl.store(Delta + off_hz * N_CTX + off_m, delta)
-
-
-# The main inner-loop logic for computing dK and dV.
-@triton.jit
-def _attn_bwd_dkdv(dk, dv,  #
-                   Q, k, v, sm_scale,  #
-                   DO,  #
-                   M, D,  #
-                   # shared by Q/K/V/DO.
-                   stride_tok, stride_d,  #
-                   H, N_CTX, BLOCK_M1: tl.constexpr,  #
-                   BLOCK_N1: tl.constexpr,  #
-                   HEAD_DIM: tl.constexpr,  #
-                   # Filled in by the wrapper.
-                   start_n, start_m, num_steps,  #
-                   MASK: tl.constexpr):
-    offs_m = start_m + tl.arange(0, BLOCK_M1)
-    offs_n = start_n + tl.arange(0, BLOCK_N1)
-    offs_k = tl.arange(0, HEAD_DIM)
-    qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
-    do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
-    # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
-    tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
-    curr_m = start_m
-    step_m = BLOCK_M1
-    for blk_idx in range(num_steps):
-        qT = tl.load(qT_ptrs)
-        # Load m before computing qk to reduce pipeline stall.
-        offs_m = curr_m + tl.arange(0, BLOCK_M1)
-        m = tl.load(M + offs_m)
-        qkT = tl.dot(k, qT)
-        pT = tl.math.exp2(qkT - m[None, :])
-        # Autoregressive masking.
-        if MASK:
-            mask = (offs_m[None, :] >= offs_n[:, None])
-            pT = tl.where(mask, pT, 0.0)
-        do = tl.load(do_ptrs)
-        # Compute dV.
-        ppT = pT
-        ppT = ppT.to(tl.float16)
-        dv += tl.dot(ppT, do)
-        # D (= delta) is pre-divided by ds_scale.
-        Di = tl.load(D + offs_m)
-        # Compute dP and dS.
-        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
-        dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(tl.float16)
-        dk += tl.dot(dsT, tl.trans(qT))
-        # Increment pointers.
-        curr_m += step_m
-        qT_ptrs += step_m * stride_tok
-        do_ptrs += step_m * stride_tok
-    return dk, dv
-
-
-# the main inner-loop logic for computing dQ
-@triton.jit
-def _attn_bwd_dq(dq, q, K, V,  #
-                 do, m, D,
-                 # shared by Q/K/V/DO.
-                 stride_tok, stride_d,  #
-                 H, N_CTX,  #
-                 BLOCK_M2: tl.constexpr,  #
-                 BLOCK_N2: tl.constexpr,  #
-                 HEAD_DIM: tl.constexpr,
-                 # Filled in by the wrapper.
-                 start_m, start_n, num_steps,  #
-                 MASK: tl.constexpr):
-    offs_m = start_m + tl.arange(0, BLOCK_M2)
-    offs_n = start_n + tl.arange(0, BLOCK_N2)
-    offs_k = tl.arange(0, HEAD_DIM)
-    kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
-    vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
-    # D (= delta) is pre-divided by ds_scale.
-    Di = tl.load(D + offs_m)
-    # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
-    tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
-    curr_n = start_n
-    step_n = BLOCK_N2
-    for blk_idx in range(num_steps):
-        kT = tl.load(kT_ptrs)
-        vT = tl.load(vT_ptrs)
-        qk = tl.dot(q, kT)
-        p = tl.math.exp2(qk - m)
-        # Autoregressive masking.
-        if MASK:
-            offs_n = curr_n + tl.arange(0, BLOCK_N2)
-            mask = (offs_m[:, None] >= offs_n[None, :])
-            p = tl.where(mask, p, 0.0)
-        # Compute dP and dS.
-        dp = tl.dot(do, vT).to(tl.float32)
-        ds = p * (dp - Di[:, None])
-        ds = ds.to(tl.float16)
-        # Compute dQ.
-        # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
-        dq += tl.dot(ds, tl.trans(kT))
-        # Increment pointers.
-        curr_n += step_n
-        kT_ptrs += step_n * stride_tok
-        vT_ptrs += step_n * stride_tok
-    return dq
-
-
-@triton.jit
-def _attn_bwd(Q, K, V, sm_scale,  #
-              DO,  #
-              DQ, DK, DV,  #
-              M, D,
-              # shared by Q/K/V/DO.
-              stride_z, stride_h, stride_tok, stride_d,  #
-              H, N_CTX,  #
-              BLOCK_M1: tl.constexpr,  #
-              BLOCK_N1: tl.constexpr,  #
-              BLOCK_M2: tl.constexpr,  #
-              BLOCK_N2: tl.constexpr,  #
-              BLK_SLICE_FACTOR: tl.constexpr,  #
-              HEAD_DIM: tl.constexpr):
-    LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
-
-    bhid = tl.program_id(2)
-    off_chz = (bhid * N_CTX).to(tl.int64)
-    adj = (stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)
-    pid = tl.program_id(0)
-
-    # offset pointers for batch/head
-    Q += adj
-    K += adj
-    V += adj
-    DO += adj
-    DQ += adj
-    DK += adj
-    DV += adj
-    M += off_chz
-    D += off_chz
-
-    # load scales
-    offs_k = tl.arange(0, HEAD_DIM)
-
-    start_n = pid * BLOCK_N1
-    start_m = start_n
-
-    MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
-    offs_n = start_n + tl.arange(0, BLOCK_N1)
-
-    dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
-    dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
-
-    # load K and V: they stay in SRAM throughout the inner loop.
-    k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
-    v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d)
-
-    num_steps = BLOCK_N1 // MASK_BLOCK_M1
-
-    dk, dv = _attn_bwd_dkdv(dk, dv,  #
-                            Q, k, v, sm_scale,  #
-                            DO,  #
-                            M, D,  #
-                            stride_tok, stride_d,  #
-                            H, N_CTX,  #
-                            MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-                            start_n, start_m, num_steps,  #
-                            MASK=True  #
-                            )
-
-    start_m += num_steps * MASK_BLOCK_M1
-    num_steps = (N_CTX - start_m) // BLOCK_M1
-
-    # Compute dK and dV for non-masked blocks.
-    dk, dv = _attn_bwd_dkdv(  #
-        dk, dv,  #
-        Q, k, v, sm_scale,  #
-        DO,  #
-        M, D,  #
-        stride_tok, stride_d,  #
-        H, N_CTX,  #
-        BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-        start_n, start_m, num_steps,  #
-        MASK=False  #
+    # This allows to get the (N_CTX, HEAD_DIM) block in the Q, K, V by selecting indexing it by batch and head
+    qvk_offset = (
+        index_batch.to(tl.int64) * stride_Q_batch
+        + index_head.to(tl.int64) * stride_Q_head
     )
 
-    dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
-    tl.store(dv_ptrs, dv)
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q + qvk_offset,
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_Q_seq, stride_Q_dim),
+        offsets=(block_index_q * BLOCK_SIZE_Q, 0),
+        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    V_block_ptr = tl.make_block_ptr(
+        base=V + qvk_offset,
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_V_seq, stride_V_dim),
+        offsets=(0, 0),
+        block_shape=(BLOCK_SIZE_KV, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    K_block_ptr = tl.make_block_ptr(
+        base=K + qvk_offset,
+        shape=(HEAD_DIM, SEQ_LEN),
+        strides=(
+            stride_K_dim,
+            stride_K_seq,
+        ),  # We invert the strides w.r.t Q, so we transpose the matrix
+        offsets=(0, 0),
+        block_shape=(HEAD_DIM, BLOCK_SIZE_KV),
+        order=(0, 1),
+    )
+
+    O_block_ptr = tl.make_block_ptr(
+        base=O + qvk_offset,
+        shape=(SEQ_LEN, HEAD_DIM),
+        strides=(stride_O_seq, stride_O_dim),
+        offsets=(block_index_q * BLOCK_SIZE_Q, 0),
+        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    # offs_q: the offsets for the tokens in the Q to process
+    offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    # offs_kv: the offsets for the tokens in the K and V sequence to process
+    offs_kv = tl.arange(0, BLOCK_SIZE_KV)
+
+    # m_i: the running maximum. We have one for each query
+    m_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) - float("inf")
+    # l_i: the running sum. We have one for each query (as we sum the attention scores by rows)
+    l_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) + 1.0
+    # acc: the accumulator for the output, which is a group of rows of the O matrix
+    O_block = tl.zeros([BLOCK_SIZE_Q, HEAD_DIM], dtype=tl.float32)
+
+    # load the blocks of Q: it will stay in SRAM throughout
+    Q_block = tl.load(Q_block_ptr)
+
+    # Stage: 3 if causal, else 1
+
+    if STAGE == 1 or STAGE == 3:
+        # This step runs for non-causal attention or for the blocks to the left of the diagonal in the causal attention
+        O_block, l_i, m_i = _attn_fwd_inner(
+            O_block,
+            l_i,
+            m_i,
+            Q_block,
+            K_block_ptr,
+            V_block_ptr,
+            block_index_q,
+            softmax_scale,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_KV,
+            4 - STAGE,
+            offs_q,
+            offs_kv,
+            SEQ_LEN,
+        )
+
+    if STAGE == 3:
+        # This step runs for the blocks to the right of the diagonal in the causal attention
+        O_block, l_i, m_i = _attn_fwd_inner(
+            O_block,
+            l_i,
+            m_i,
+            Q_block,
+            K_block_ptr,
+            V_block_ptr,
+            block_index_q,
+            softmax_scale,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_KV,
+            2,
+            offs_q,
+            offs_kv,
+            SEQ_LEN,
+        )
+    # epilogue
+    m_i += tl.math.log(
+        l_i
+    )  # This is needed to compute the logsumexp for the backwards pass
+    O_block = O_block / l_i[:, None]
+    m_ptrs = M + index_batch_head * SEQ_LEN + offs_q
+    tl.store(m_ptrs, m_i)
+    tl.store(O_block_ptr, O_block.to(O.type.element_ty))
+
+
+@triton.jit
+def _attn_bwd_preprocess(
+    O,
+    dO,
+    D,
+    SEQ_LEN,
+    BLOCK_SIZE_Q: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    block_index_q = tl.program_id(0)
+    offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    index_batch_head = tl.program_id(1)
+    offs_dim = tl.arange(0, HEAD_DIM)
+    # Load a single block of BLOCK_SIZE_Q rows of O
+    O_block = tl.load(
+        O
+        + index_batch_head * HEAD_DIM * SEQ_LEN
+        + offs_q[:, None] * HEAD_DIM
+        + offs_dim[None, :]
+    )
+    # Load a single block of BLOCK_SIZE_Q rows of dO
+    dO_block = tl.load(
+        dO
+        + index_batch_head * HEAD_DIM * SEQ_LEN
+        + offs_q[:, None] * HEAD_DIM
+        + offs_dim[None, :]
+    ).to(tl.float32)
+    # Compute the D block
+    D_block = tl.sum(dO_block * O_block, axis=1)  # Shape: (BLOCK_SIZE_Q,)
+    # Store the D block
+    D_block_ptrs = D + index_batch_head * SEQ_LEN + offs_q
+    tl.store(D_block_ptrs, D_block)
+
+
+@triton.jit
+def _attn_bwd_dq(
+    Q,
+    K,
+    V,
+    softmax_scale,
+    dO,
+    dQ,
+    dK,
+    dV,
+    M,
+    D,
+    stride_batch,
+    stride_head,
+    stride_seq,
+    stride_dim,
+    NUM_HEADS,
+    SEQ_LEN,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    index_batch_head = tl.program_id(2)
+    index_batch = index_batch_head // NUM_HEADS
+    index_head = index_batch_head % NUM_HEADS
+    offset_batch_head = (stride_batch * index_batch + stride_head * index_head).to(
+        tl.int64
+    )
+    # This is the offset that allows us to select the right sequence given the batch and head.
+    offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
+
+    # Make sure the pointers are in the right place w.r.t batch and head
+    # The reason we don't access the blocks through make_block_ptr is because we need to use the range of offsets to apply the masking
+    Q += offset_batch_head
+    K += offset_batch_head
+    V += offset_batch_head
+    dO += offset_batch_head
+    dQ += offset_batch_head
+    dK += offset_batch_head
+    dV += offset_batch_head
+
+    # Make sure the pointers are in the right place w.r.t batch, head and sequence
+    M += offset_batch_head_seq
+    D += offset_batch_head_seq
+
+    # load scales
+    offs_dim = tl.arange(0, HEAD_DIM)
+
+    index_block_kv = tl.program_id(0)
+
+    start_q = index_block_kv * BLOCK_Q
+    offs_q = start_q + tl.arange(0, BLOCK_Q)
+
+    Q_block = tl.load(Q + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim)
+    dQ_block = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
+    dO_block = tl.load(
+        dO + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    )
+
+    M_block = tl.load(M + offs_q)
+    M_block = M_block[:, None]
+
+    offs_kv = tl.arange(0, BLOCK_KV)
+
+    # We access the K and V as transposed blocks
+    kT_ptrs = K + offs_kv[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+    vT_ptrs = V + offs_kv[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+
+    Di = tl.load(D + offs_q)
+
+    curr_kv = 0
+    num_steps = SEQ_LEN // BLOCK_KV
+    for blk_idx in range(num_steps):
+        K_T_block = tl.load(kT_ptrs)
+        V_T_block = tl.load(vT_ptrs)
+        QK_block = softmax_scale * tl.dot(Q_block, K_T_block)
+        P_block = tl.math.exp(QK_block - M_block)
+
+        if STAGE == 3:
+            # Autoregressive masking.
+            offs_kv = curr_kv + tl.arange(0, BLOCK_KV)
+            mask_block = offs_q[:, None] >= offs_kv[None, :]
+            P_block = tl.where(mask_block, P_block, 0.0)
+
+        # Compute dP and dS.
+        dP_block = tl.dot(dO_block, V_T_block).to(tl.float32)
+        dS_block = P_block * (dP_block - Di[:, None])
+        # Convert to the same dtype as K_T_block
+        dS_block = dS_block.to(K_T_block.dtype)
+        # Compute dQ.
+        # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
+        dQ_block += softmax_scale * tl.dot(dS_block, tl.trans(K_T_block))
+        # Increment pointers.
+        curr_kv += BLOCK_KV
+        kT_ptrs += BLOCK_KV * stride_seq
+        vT_ptrs += BLOCK_KV * stride_seq
+
+    dQ_block_ptrs = dQ + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    tl.store(dQ_block_ptrs, dQ_block)
+
+
+@triton.jit
+def _attn_bwd_dk_dv(
+    Q,
+    K,
+    V,
+    softmax_scale,
+    dO,
+    dQ,
+    dK,
+    dV,
+    M,
+    D,
+    stride_batch,
+    stride_head,
+    stride_seq,
+    stride_dim,
+    NUM_HEADS,
+    SEQ_LEN,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    index_batch_head = tl.program_id(2)
+    index_batch = index_batch_head // NUM_HEADS
+    index_head = index_batch_head % NUM_HEADS
+    offset_batch_head = (stride_batch * index_batch + stride_head * index_head).to(
+        tl.int64
+    )
+    # This is the offset that allows us to select the right sequence given the batch and head.
+    offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
+
+    # Make sure the pointers are in the right place w.r.t batch and head
+    # The reason we don't access the blocks through make_block_ptr is because we need to use the range of offsets to apply the masking
+    Q += offset_batch_head
+    K += offset_batch_head
+    V += offset_batch_head
+    dO += offset_batch_head
+    dQ += offset_batch_head
+    dK += offset_batch_head
+    dV += offset_batch_head
+
+    # Make sure the pointers are in the right place w.r.t batch, head and sequence
+    M += offset_batch_head_seq
+    D += offset_batch_head_seq
+
+    # load scales
+    offs_dim = tl.arange(0, HEAD_DIM)
+
+    index_block_kv = tl.program_id(0)
+    start_kv = index_block_kv * BLOCK_KV
+
+    offs_kv = start_kv + tl.arange(0, BLOCK_KV)
+
+    dV_block = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+    dK_block = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+
+    # load K and V: they stay in SRAM throughout the inner loop.
+    K_block = tl.load(
+        K + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    )  # Shape: (BLOCK_KV1, HEAD_DIM)
+    V_block = tl.load(
+        V + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    )  # Shape: (BLOCK_KV1, HEAD_DIM)
+
+    offs_q = tl.arange(0, BLOCK_Q)
+
+    # We access the Q as a transposed array, so that's why we treat offs_q as a column vector ans offs_dim as a row vector
+    # This is equivalent to doing:
+    # q_ptrs = Q + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    # qT_ptrs = tl.trans(q_ptrs)
+    # We point to the first BLOCK_Q rows of Q for both the qT and dO pointers, inside the for loop we will move forward by BLOCK_Q rows at each iteration.
+    qT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None] * stride_dim
+    dO_ptrs = dO + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+
+    # Iterates over the sequence dimension of the query
+    curr_q = 0
+    num_steps = SEQ_LEN // BLOCK_Q
+    for blk_idx in range(num_steps):
+        # Load a block of Q
+        qT_block = tl.load(qT_ptrs)
+        # Load the logsumexp values for the queries in the current block
+        offs_q = curr_q + tl.arange(0, BLOCK_Q)
+        m = tl.load(M + offs_q)
+
+        # This gives us (QK^T)^T = (K^T)^T(Q^T) = K(Q^T) = P^T
+        QK_T_block = softmax_scale * tl.dot(K_block, qT_block)
+        # We apply the softmax by using the logsumexp trick
+        P_T_block = tl.math.exp(QK_T_block - m[None, :])
+
+        if STAGE == 3:
+            # Autoregressive masking.
+            # mask is True for all values that DO NOT NEED TO BE MASKED
+            mask_block = (
+                offs_q[None, :] >= offs_kv[:, None]
+            )  # Shape: (BLOCK_KV1, BLOCK_Q1)
+            # Replace all the masked values with 0.
+            # In this case we do not need to mask with -Inf before applying the softmax since we already computed the normalization factors (stored in "m")
+            P_T_block = tl.where(mask_block, P_T_block, 0.0)
+
+        dO_block = tl.load(dO_ptrs)
+        # According to the formula: dV_new = dV_old + P^T x dO, where x is the matrix multiplication
+        # Convert P_T_block to the same dtype as dO_block
+        dV_block += tl.dot(P_T_block.to(dO_block.dtype), dO_block)
+
+        # Delta = rowsum(O * dO) where * is the element-wise product
+        Di = tl.load(D + offs_q)
+
+        # dP = dO x V^T, so dP^T = V x dO^T
+        # Where x is the matrix multiplication
+        dpT_block = tl.dot(V_block, tl.trans(dO_block)).to(tl.float32)
+
+        # We know that dS = P * (dP - Delta), so dS^T = P^T * (dP^T - Delta^T)
+
+        dS_T_block = P_T_block * (dpT_block - Di[None, :])
+        # Convert to the same dtype as qT_block
+        dS_T_block = dS_T_block.to(qT_block.dtype)
+
+        # According to the formula on the paper: dK_new = dK_old + dS^T x Q
+        dK_block += softmax_scale * tl.dot(dS_T_block, tl.trans(qT_block))
+        # Increment pointers.
+        curr_q += BLOCK_Q
+        qT_ptrs += BLOCK_Q * stride_seq
+        dO_ptrs += BLOCK_Q * stride_seq
+
+    # Write back dV.
+    dV_block_ptrs = dV + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    tl.store(dV_block_ptrs, dV_block)
 
     # Write back dK.
-    dk *= sm_scale
-    dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
-    tl.store(dk_ptrs, dk)
-
-    # THIS BLOCK DOES DQ:
-    start_m = pid * BLOCK_M2
-    end_n = start_m + BLOCK_M2
-
-    MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
-    offs_m = start_m + tl.arange(0, BLOCK_M2)
-
-    q = tl.load(Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
-    dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
-    do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d)
-
-    m = tl.load(M + offs_m)
-    m = m[:, None]
-
-    # Compute dQ for masked (diagonal) blocks.
-    # NOTE: This code scans each row of QK^T backward (from right to left,
-    # but inside each call to _attn_bwd_dq, from left to right), but that's
-    # not due to anything important.  I just wanted to reuse the loop
-    # structure for dK & dV above as much as possible.
-    num_steps = BLOCK_M2 // MASK_BLOCK_N2
-    dq = _attn_bwd_dq(dq, q, K, V,  #
-                      do, m, D,  #
-                      stride_tok, stride_d,  #
-                      H, N_CTX,  #
-                      BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
-                      start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,  #
-                      MASK=True  #
-                      )
-    end_n -= num_steps * MASK_BLOCK_N2
-    # stage 2
-    num_steps = end_n // BLOCK_N2
-    dq = _attn_bwd_dq(dq, q, K, V,  #
-                      do, m, D,  #
-                      stride_tok, stride_d,  #
-                      H, N_CTX,  #
-                      BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
-                      start_m, end_n - num_steps * BLOCK_N2, num_steps,  #
-                      MASK=False  #
-                      )
-    # Write back dQ.
-    dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
-    dq *= LN2
-    tl.store(dq_ptrs, dq)
+    dK_block_ptrs = dK + offs_kv[:, None] * stride_seq + offs_dim[None, :] * stride_dim
+    tl.store(dK_block_ptrs, dK_block)
 
 
-class _attention(torch.autograd.Function):
+class TritonAttention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=True, rel_bias=None):
-        # shape constraints
-        HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
-        # when v is in float8_e5m2 it is transposed.
-        HEAD_DIM_V = v.shape[-1]
+    def forward(ctx, Q, K, V, causal, softmax_scale):
+        HEAD_DIM_Q, HEAD_DIM_K = Q.shape[-1], K.shape[-1]
+        HEAD_DIM_V = V.shape[-1]
+
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
+
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
-        assert HEAD_DIM_K in {16, 32, 64, 128, 256}
-        o = torch.empty_like(q)
+
+        O = torch.empty_like(Q)
         stage = 3 if causal else 1
-        extra_kern_args = {}
-        # Tuning for AMD target
-        if is_hip():
-            waves_per_eu = 3 if HEAD_DIM_K <= 64 else 2
-            extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        # Use device_descriptor for Hopper + warpspec.
-        if supports_host_descriptor() and not (is_hopper() and warp_specialize):
-            # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
-            y_dim = q.shape[0] * q.shape[1] * q.shape[2]
+        grid = lambda args: (
+            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
+            BATCH_SIZE * NUM_HEADS,
+            1,
+        )
 
-            dummy_block = [1, 1]
-            desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-            if q.dtype == torch.float8_e5m2:
-                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1],
-                                          block_shape=dummy_block)
-            else:
-                desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
-                                          block_shape=dummy_block)
-            desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-            desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-        else:
-            desc_q = q
-            desc_v = v
-            desc_k = k
-            desc_o = o
+        # M is the logsumexp for the backward pass, one for each query
+        M = torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=Q.device, dtype=torch.float32
+        )
 
-        def alloc_fn(size: int, align: int, _):
-            return torch.empty(size, dtype=torch.int8, device="cuda")
-
-        triton.set_allocator(alloc_fn)
-
-        def grid(META):
-            return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
-
-        ctx.grid = grid
-        if is_blackwell() and warp_specialize:
-            if HEAD_DIM_K == 128 and q.dtype == torch.float16:
-                extra_kern_args["maxnreg"] = 168
-            else:
-                extra_kern_args["maxnreg"] = 80
-        # Handle relative position bias
-        rel_bias_ptr = None
-        bias_max_len = 512  # default max relative position
-        if rel_bias is not None:
-            rel_bias_ptr = rel_bias
-            bias_max_len = rel_bias.shape[-1] // 2  # bias has shape [n_heads, 2*max_len-1]
-        
         _attn_fwd[grid](
-            sm_scale, M,  #
-            q.shape[0], q.shape[1],  #
-            desc_q, desc_k, desc_v, desc_o,  #
-            N_CTX=q.shape[2],  #
-            HEAD_DIM=HEAD_DIM_K,  #
-            FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
-            STAGE=stage,  #
-            warp_specialize=warp_specialize,  #
-            IS_HOPPER=is_hopper(),  #
-            rel_bias_ptr=rel_bias_ptr,  #
-            bias_max_len=bias_max_len,  #
-            **extra_kern_args)
+            Q=Q,
+            K=K,
+            V=V,
+            softmax_scale=softmax_scale,
+            M=M,
+            O=O,
+            stride_Q_batch=Q.stride(0),
+            stride_Q_head=Q.stride(1),
+            stride_Q_seq=Q.stride(2),
+            stride_Q_dim=Q.stride(3),
+            stride_K_batch=K.stride(0),
+            stride_K_head=K.stride(1),
+            stride_K_seq=K.stride(2),
+            stride_K_dim=K.stride(3),
+            stride_V_batch=V.stride(0),
+            stride_V_head=V.stride(1),
+            stride_V_seq=V.stride(2),
+            stride_V_dim=V.stride(3),
+            stride_O_batch=O.stride(0),
+            stride_O_head=O.stride(1),
+            stride_O_seq=O.stride(2),
+            stride_O_dim=O.stride(3),
+            BATCH_SIZE=Q.shape[0],
+            NUM_HEADS=Q.shape[1],
+            SEQ_LEN=Q.shape[2],
+            HEAD_DIM=HEAD_DIM_K,
+            STAGE=stage,
+        )
 
-        ctx.save_for_backward(q, k, v, o, M, rel_bias)
-        ctx.sm_scale = sm_scale
+        ctx.save_for_backward(Q, K, V, O, M)
+        ctx.grid = grid
+        ctx.softmax_scale = softmax_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
-        return o
+        return O
 
     @staticmethod
-    def backward(ctx, do):
-        q, k, v, o, M, rel_bias = ctx.saved_tensors
-        assert do.is_contiguous()
-        assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
-        dq = torch.empty_like(q)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
-        BATCH, N_HEAD, N_CTX = q.shape[:3]
-        PRE_BLOCK = 128
-        NUM_WARPS, NUM_STAGES = 4, 5
-        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
-        BLK_SLICE_FACTOR = 2
-        RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
-        arg_k = k
-        arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
-        PRE_BLOCK = 128
-        assert N_CTX % PRE_BLOCK == 0
-        pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
-        delta = torch.empty_like(M)
-        _attn_bwd_preprocess[pre_grid](
-            o, do,  #
-            delta,  #
-            BATCH, N_HEAD, N_CTX,  #
-            BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
-        )
-        grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
-        _attn_bwd[grid](
-            q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,  #
-            M, delta,  #
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
-            N_HEAD, N_CTX,  #
-            BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
-            BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,  #
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
-            HEAD_DIM=ctx.HEAD_DIM,  #
-            num_warps=NUM_WARPS,  #
-            num_stages=NUM_STAGES  #
+    def backward(ctx, dO):
+        Q, K, V, O, M = ctx.saved_tensors
+
+        assert dO.is_contiguous()
+        assert Q.stride() == K.stride() == V.stride() == O.stride() == dO.stride()
+        dQ = torch.empty_like(Q)
+        dK = torch.empty_like(K)
+        dV = torch.empty_like(V)
+
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN = Q.shape[:3]
+        NUM_WARPS, NUM_STAGES = 4, 3
+        BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
+
+        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
+        D = torch.empty_like(M)  # Shape: (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
+
+        # Compute all the elements Di
+        _attn_bwd_preprocess[preprocess_grid](
+            O=O,
+            dO=dO,
+            D=D,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_SIZE_Q=BLOCK_SIZE_MACRO,
+            HEAD_DIM=ctx.HEAD_DIM,
         )
 
-        # Compute gradient for rel_bias if it was provided
-        drel_bias = None
-        if rel_bias is not None:
-            # For simplicity, we'll skip the bias gradient computation in backward
-            # You can implement this if needed
-            drel_bias = None
-        
-        return dq, dk, dv, None, None, None, drel_bias
+        grid = (SEQ_LEN // BLOCK_SIZE_MACRO, 1, BATCH_SIZE * NUM_HEADS)
 
+        stage = 3 if ctx.causal else 1
 
-attention = _attention.apply
-
-
-class FlashAttentionWithBias(nn.Module):
-    """Flash Attention with learnable relative position bias."""
-    
-    def __init__(self, num_heads, bias_max_len=512, causal=True):
-        super().__init__()
-        self.num_heads = num_heads
-        self.bias_max_len = bias_max_len
-        self.causal = causal
-        
-        # Create learnable relative position bias
-        # Shape: [num_heads, 2*bias_max_len-1]
-        # This covers relative positions from -(bias_max_len-1) to (bias_max_len-1)
-        self.rel_bias = nn.Parameter(
-            torch.zeros(num_heads, 2 * bias_max_len - 1)
+        # Fix KV and iterate through all the Q blocks
+        _attn_bwd_dk_dv[grid](
+            Q=Q,
+            K=K,
+            V=V,
+            softmax_scale=ctx.softmax_scale,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            M=M,
+            D=D,
+            stride_batch=Q.stride(0),
+            stride_head=Q.stride(1),
+            stride_seq=Q.stride(2),
+            stride_dim=Q.stride(3),
+            NUM_HEADS=NUM_HEADS,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_Q=BLOCK_SIZE_MICRO,
+            BLOCK_KV=BLOCK_SIZE_MACRO,
+            HEAD_DIM=ctx.HEAD_DIM,
+            STAGE=stage,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
         )
-        
-        # Initialize bias (you can use different initialization strategies)
-        nn.init.normal_(self.rel_bias, std=0.02)
-    
-    def forward(self, q, k, v, sm_scale=None, warp_specialize=True):
-        """
-        Args:
-            q: [batch, num_heads, seq_len, head_dim]
-            k: [batch, num_heads, seq_len, head_dim]
-            v: [batch, num_heads, seq_len, head_dim]
-            sm_scale: scaling factor for attention
-        """
-        if sm_scale is None:
-            sm_scale = q.shape[-1] ** -0.5
-        
-        return attention(q, k, v, self.causal, sm_scale, warp_specialize, self.rel_bias)
 
-TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
+        # Fix Q and iterate through all the KV block
+        _attn_bwd_dq[grid](
+            Q=Q,
+            K=K,
+            V=V,
+            softmax_scale=ctx.softmax_scale,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            M=M,
+            D=D,
+            stride_batch=Q.stride(0),
+            stride_head=Q.stride(1),
+            stride_seq=Q.stride(2),
+            stride_dim=Q.stride(3),
+            NUM_HEADS=NUM_HEADS,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_Q=BLOCK_SIZE_MACRO,
+            BLOCK_KV=BLOCK_SIZE_MICRO,
+            HEAD_DIM=ctx.HEAD_DIM,
+            STAGE=stage,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
+        )
+
+        return dQ, dK, dV, None, None
 
 
-@pytest.mark.parametrize("Z", [1, 4])
-@pytest.mark.parametrize("H", [2, 48])
-@pytest.mark.parametrize("N_CTX", [128, 1024, (2 if is_hip() else 4) * 1024])
-@pytest.mark.parametrize("HEAD_DIM", [64, 128])
-@pytest.mark.parametrize("causal", [True])  # FIXME: Non-causal tests do not pass at the moment.
-@pytest.mark.parametrize("warp_specialize", [False, True] if is_blackwell() else [False])
-@pytest.mark.parametrize("mode", ["fwd", "bwd"])
-@pytest.mark.parametrize("provider", ["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []))
-def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtype=torch.float16):
-    if mode == "fwd" and "fp16" in provider:
-        pytest.skip("Avoid running the forward computation twice.")
-    if mode == "bwd" and "fp8" in provider:
-        pytest.skip("Backward pass with FP8 is not supported.")
-    torch.manual_seed(20)
-    q = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_())
-    sm_scale = 0.5
+def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
+    Q = (
+        torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+        )
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+    K = (
+        torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+        )
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+    V = (
+        torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+        )
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+
+    softmax_scale = 1 / (HEAD_DIM**0.5)
+    dO = torch.randn_like(Q)
+
     # reference implementation
-    ref_dtype = dtype
-    if mode == "fwd" and "fp8" in provider:
-        ref_dtype = torch.float32
-    q = q.to(ref_dtype)
-    k = k.to(ref_dtype)
-    v = v.to(ref_dtype)
-    M = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))
-    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+    MASK = torch.tril(torch.ones((SEQ_LEN, SEQ_LEN), device="cuda"))
+    P = torch.matmul(Q, K.transpose(2, 3)) * softmax_scale
     if causal:
-        p[:, :, M == 0] = float("-inf")
-    p = torch.softmax(p.float(), dim=-1)
-    p = p.to(ref_dtype)
-    # p = torch.exp(p)
-    ref_out = torch.matmul(p, v).half()
-    if mode == "bwd":
-        dout = torch.randn_like(q)
-        ref_out.backward(dout)
-        ref_dv, v.grad = v.grad.clone(), None
-        ref_dk, k.grad = k.grad.clone(), None
-        ref_dq, q.grad = q.grad.clone(), None
+        P[:, :, MASK == 0] = float("-inf")
+    P = torch.softmax(P.float(), dim=-1).half()
+    ref_O = torch.matmul(P, V)
+    ref_O.backward(dO)
+    ref_dV, V.grad = V.grad.clone(), None
+    ref_dK, K.grad = K.grad.clone(), None
+    ref_dQ, Q.grad = Q.grad.clone(), None
+
     # triton implementation
-    if mode == "fwd" and "fp8" in provider:
-        q = q.to(torch.float8_e5m2)
-        k = k.to(torch.float8_e5m2)
-        v = v.permute(0, 1, 3, 2).contiguous()
-        v = v.permute(0, 1, 3, 2)
-        v = v.to(torch.float8_e5m2)
-    tri_out = attention(q, k, v, causal, sm_scale, warp_specialize).half()
-    if mode == "fwd":
-        atol = 3 if "fp8" in provider else 1e-2
-        torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
-        return
-    tri_out.backward(dout)
-    tri_dv, v.grad = v.grad.clone(), None
-    tri_dk, k.grad = k.grad.clone(), None
-    tri_dq, q.grad = q.grad.clone(), None
+    tri_out = TritonAttention.apply(Q, K, V, causal, softmax_scale).half()
+    tri_out.backward(dO)
+    tri_dV, V.grad = V.grad.clone(), None
+    tri_dK, K.grad = K.grad.clone(), None
+    tri_dQ, Q.grad = Q.grad.clone(), None
+
     # compare
-    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
     rtol = 0.0
-    # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
-    # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
-    if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
-        rtol = 1e-2
-    torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
-    torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
-    torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
-
-
-try:
-    from flash_attn.flash_attn_interface import \
-        flash_attn_qkvpacked_func as flash_attn_func
-    HAS_FLASH = True
-except BaseException:
-    HAS_FLASH = False
-
-TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
-BATCH, N_HEADS = 4, 32
-# vary seq length for fixed head and batch=4
-configs = []
-for HEAD_DIM in [64, 128]:
-    for mode in ["fwd", "bwd"]:
-        for causal in [True, False]:
-            # Enable warpspec for causal fwd on Hopper
-            enable_ws = mode == "fwd" and (is_blackwell() or (is_hopper() and not causal))
-            for warp_specialize in [False, True] if enable_ws else [False]:
-                configs.append(
-                    triton.testing.Benchmark(
-                        x_names=["N_CTX"],
-                        x_vals=[2**i for i in range(10, 15)],
-                        line_arg="provider",
-                        line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
-                        (["flash"] if HAS_FLASH else []),
-                        line_names=["Triton [FP16]"] + (["Triton [FP8]"] if TORCH_HAS_FP8 else []) +
-                        (["Flash-2"] if HAS_FLASH else []),
-                        styles=[("red", "-"), ("blue", "-"), ("green", "-")],
-                        ylabel="TFLOPS",
-                        plot_name=
-                        f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-causal={causal}-warp_specialize={warp_specialize}",
-                        args={
-                            "H": N_HEADS,
-                            "BATCH": BATCH,
-                            "HEAD_DIM": HEAD_DIM,
-                            "mode": mode,
-                            "causal": causal,
-                            "warp_specialize": warp_specialize,
-                        },
-                    ))
-
-
-@triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, device=DEVICE):
-    assert mode in ["fwd", "bwd"]
-    dtype = torch.float16
-    if "triton" in provider:
-        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        if mode == "fwd" and "fp8" in provider:
-            q = q.to(torch.float8_e5m2)
-            k = k.to(torch.float8_e5m2)
-            v = v.permute(0, 1, 3, 2).contiguous()
-            v = v.permute(0, 1, 3, 2)
-            v = v.to(torch.float8_e5m2)
-        sm_scale = 1.3
-        fn = lambda: attention(q, k, v, causal, sm_scale, warp_specialize)
-        if mode == "bwd":
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn)
-
-    if provider == "flash":
-        qkv = torch.randn((BATCH, N_CTX, 3, H, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        fn = lambda: flash_attn_func(qkv, causal=causal)
-        if mode == "bwd":
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn)
-    flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
-    total_flops = 2 * flops_per_matmul
-    if causal:
-        total_flops *= 0.5
-    if mode == "bwd":
-        total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
-    return total_flops * 1e-12 / (ms * 1e-3)
+    atol = 1e-2
+    assert torch.allclose(ref_O, tri_out, atol=atol, rtol=rtol)
+    assert torch.allclose(ref_dK, tri_dK, atol=atol, rtol=rtol)
+    assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)
+    assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
-    # only works on post-Ampere GPUs right now
-    bench_flash_attention.run(save_path=".", print_data=True)
+    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=True)
+    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=False)
+    print("PASSED")

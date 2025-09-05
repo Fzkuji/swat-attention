@@ -11,23 +11,13 @@ import torch.nn as nn
 from einops import rearrange
 from transformers.utils import logging
 
-# from fla.layers.utils import pad_input, unpad_input  # Not needed with custom flash attention
-from fla.modules import RMSNorm
-# from fla.ops.utils.index import prepare_lens_from_mask  # Not needed with our custom implementation
-# Import our custom flash attention with bias
-from fla.layers.flash_attn import FlashAttentionWithBias
+from fla.layers.utils import pad_input, unpad_input
+from fla.modules import RMSNorm, RotaryEmbedding
+from fla.ops.utils.index import prepare_lens_from_mask
 
 if TYPE_CHECKING:
     from fla.models.utils import Cache
 
-try:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-except ImportError:
-    warnings.warn(
-        "Flash Attention is not installed. Please install it via `pip install flash-attn --no-build-isolation`",
-        category=ImportWarning
-    )
-    flash_attn_func = None
 
 logger = logging.get_logger(__name__)
 
@@ -200,10 +190,7 @@ class SWAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.layer_idx = layer_idx
-        self.bias_max_len = 512  # Maximum relative position for bias, can be configured
 
-        # No longer check for flash_attn_func since we're using our custom implementation
-        
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=self.qkv_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=self.qkv_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=self.qkv_bias)
@@ -213,15 +200,8 @@ class SWAttention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim)
             self.k_norm = RMSNorm(self.head_dim)
 
-        # Replace rotary with our learnable relative position bias
+        # Remove RoPE - we'll use learnable bias instead
         # self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
-        
-        # Initialize custom flash attention with learnable bias
-        self.flash_attn = FlashAttentionWithBias(
-            num_heads=self.num_heads,
-            bias_max_len=self.bias_max_len,
-            causal=True
-        )
 
     def forward(
         self,
@@ -248,25 +228,46 @@ class SWAttention(nn.Module):
         if self.qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
 
-        # Handle past key values if needed
-        # Note: For simplicity, we're not handling cu_seqlens and past_key_values in this version
-        # You can add this support if needed for your use case
+        # equivalent to cu_seqlens in `flash_attn`
+        cu_seqlens = kwargs.get('cu_seqlens', None)
 
-        # Handle KV cache if needed (simplified for now)
-        # You can implement full cache support if required
+        seqlen_offset, max_seqlen = 0, q_len
+        if past_key_values is not None:
+            seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
+            max_seqlen = q.shape[1] + seqlen_offset
 
-        # Use our custom flash attention with learnable relative position bias
-        # Note: For simplicity, we'll handle the main case without padding optimizations
-        # You can add padding handling if needed
+            if attention_mask is not None:
+                # to deliminate the offsets of padding tokens
+                seqlen_offset = seqlen_offset + prepare_lens_from_mask(attention_mask) - attention_mask.shape[-1]
+                max_seqlen = q.shape[1] + max(seqlen_offset)
+
+        # Remove RoPE encoding - we'll rely on ALiBi or learnable bias
+        # if self.max_position_embeddings is not None:
+        #     max_seqlen = max(max_seqlen, self.max_position_embeddings)
+        # q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen, cu_seqlens=cu_seqlens)
+
+        if past_key_values is not None:
+            cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
+            k_cached, v_cached = past_key_values.update(
+                attn_state=(k.flatten(-2, -1), v.flatten(-2, -1)),
+                layer_idx=self.layer_idx,
+                offset=q_len,
+                cache_kwargs=dict(window_size=self.window_size)
+            )['attn_state']
+            if cache_has_content:
+                k, v = k_cached, v_cached
+                k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
+                v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
+
+        # Use our flash focus attention implementation
+        from fla.layers.flash_attn import TritonAttention as flash_focus_attn
         
-        # Compute scale
         sm_scale = self.head_dim ** -0.5
-        
-        # Apply our custom flash attention
-        o = self.flash_attn(q, k, v, sm_scale=sm_scale)
+        causal = True
+        o = flash_focus_attn.apply(q, k, v, causal, sm_scale)
         o = o.reshape(batch_size, q_len, -1)
         o = self.o_proj(o)
 
-        attentions = None  # We don't return attention weights with flash attention
-
+        attentions = None if not output_attentions else None
+        
         return o, attentions, past_key_values
