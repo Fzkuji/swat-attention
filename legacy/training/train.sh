@@ -90,7 +90,7 @@ if [ "$checkpoint" != "" ]; then
   params+=" --resume_from_checkpoint $checkpoint"
 fi
 if [ "$WANDB_DISABLED" != "true" ]; then
-  params+=" --report_to wandb \
+  params+=" --report_to none \
   --run_name $type.$(basename $path)"
 else
   params+=" --report_to none"

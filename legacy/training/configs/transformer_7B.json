@@ -5,14 +5,17 @@
     "fuse_cross_entropy": true,
     "fuse_norm": true,
     "hidden_act": "swish",
-    "hidden_size": 1024,
+    "hidden_ratio": 4,
+    "hidden_size": 4096,
     "initializer_range": 0.02,
-    "max_position_embeddings": 8192,
+    "intermediate_size": 14336,
     "model_type": "transformer",
-    "num_heads": 16,
-    "num_hidden_layers": 24,
     "norm_eps": 1e-06,
+    "num_heads": 32,
+    "num_hidden_layers": 32,
+    "num_kv_heads": 8,
+    "rope_theta": 10000.0,
     "tie_word_embeddings": false,
     "use_cache": true,
-    "vocab_size": 32000
+    "window_size": null
 }

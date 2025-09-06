@@ -44,7 +44,7 @@ python preprocess.py \
   --dataset HuggingFaceFW/fineweb-edu \
   --name sample-10BT \
   --split train \
-  --context_length 2048
+  --seq_len 1024
 ```
 
 This will cache the processed dataset at `data/HuggingFaceFW/fineweb-edu/sample-10BT/train`.
@@ -57,7 +57,7 @@ git clone https://huggingface.co/datasets/cerebras/SlimPajama-627B --depth 1
 python preprocess.py \
   --dataset SlimPajama-627B \
   --split train \
-  --context_length 2048
+  --seq_len 2048
 ```
 
 ## Training from scratch
