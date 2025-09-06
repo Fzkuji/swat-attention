@@ -95,7 +95,7 @@ class LogCallback(TrainerCallback, ExportableState):
         logs = dict(
             current_steps=state.global_step,
             total_steps=state.max_steps,
-            loss=state.log_history[-1].get("loss", None),
+            loss=state.log_history[-1].get("loss", None) / args.world_size / args.gradient_accumulation_steps,
             eval_loss=state.log_history[-1].get("eval_loss", None),
             predict_loss=state.log_history[-1].get("predict_loss", None),
             learning_rate=state.log_history[-1].get("learning_rate", None),
