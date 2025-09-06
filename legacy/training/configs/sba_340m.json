@@ -7,7 +7,7 @@
     "hidden_act": "swish",
     "hidden_size": 1024,
     "initializer_range": 0.006,
-    "max_position_embeddings": 8192,
+    "max_position_embeddings": 65536,
     "model_type": "sba",
     "num_heads": 16,
     "num_hidden_layers": 24,
