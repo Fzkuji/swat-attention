@@ -15,10 +15,8 @@ from transformers.utils import logging
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
+    """  
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)    """
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
@@ -85,138 +83,65 @@ class SWAttention(nn.Module):
 
         # No longer requiring flash attention
         # Don't pre-allocate mask to save memory
-
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=self.qkv_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=self.qkv_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=self.qkv_bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
-        if qk_norm:
-            self.q_norm = RMSNorm(self.head_dim)
-            self.k_norm = RMSNorm(self.head_dim)
-
-        self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
-
         # 初始化可学习的位置bias矩阵
         if self.use_learnable_bias:
             self._init_learnable_position_bias()
 
-        # 每个头有独立的偏移值
-        self.softmax_offset = nn.Parameter(torch.full((self.num_heads,), -0.01))
+            # 每个头的softmax归一化偏置（加到分母上）
+        # 初始化为0，这样初始时softmax行为正常（和为1）
+        self.softmax_norm_bias = nn.Parameter(torch.zeros(self.num_heads))
 
     def _init_learnable_position_bias(self):
-        """初始化可学习的位置bias矩阵，每个头都有独立的bias矩阵"""
-        # 创建可学习的bias矩阵：[num_heads, max_bias_length, max_bias_length]
-        self.learnable_bias = nn.Parameter(
-            torch.zeros(self.num_heads, self.max_bias_length, self.max_bias_length)
+        """初始化可学习的位置bias参数，每个头都有独立的对角线参数（仅用于causal attention）"""
+        # 创建可学习的对角线参数：[num_heads, max_bias_length]
+        # 存储主对角线和所有下对角线的值
+        self.learnable_bias_diagonals = nn.Parameter(
+            torch.zeros(self.num_heads, self.max_bias_length)
         )
 
-        # 用很小的随机值初始化 (例如正态分布, std=1e-2)
-        nn.init.normal_(self.learnable_bias, mean=0.0, std=1e-3)
+        # 用很小的随机值初始化 (例如正态分布, std=1e-3)
+        nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=1e-3)
         # # 使用ALiBi初始化
-        # self._init_with_alibi()
+        # self._init_with_alibi_diagonals()
 
-    def _get_alibi_slopes(self, num_heads):
-        """获取ALiBi的斜率值"""
+    def get_learnable_bias(self):
+        """获取可学习的对角线bias参数"""
+        # 直接返回对角线参数
+        # [num_heads, max_bias_length]
+        return self.learnable_bias_diagonals
 
-        def get_slopes_power_of_2(n):
-            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
-            ratio = start
-            return [start * (ratio ** i) for i in range(n)]
+    def apply_learnable_bias_efficient(self, attn_weights):
+        """高效地应用对角线 bias，使用GPU并行操作，避免大内存占用"""
+        batch_size, num_heads, seq_len_q, seq_len_k = attn_weights.shape
 
-        if math.log2(num_heads).is_integer():
-            return get_slopes_power_of_2(num_heads)
-        else:
-            closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
-            slopes = get_slopes_power_of_2(closest_power_of_2)
+        # 创建相对位置索引矩阵 [seq_len_q, seq_len_k]        q_pos = torch.arange(seq_len_q, device=attn_weights.device, dtype=torch.long)
+        k_pos = torch.arange(seq_len_k, device=attn_weights.device, dtype=torch.long)
+        rel_pos = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)
 
-            extra_heads = num_heads - closest_power_of_2
-            if extra_heads > 0:
-                extra_slopes = get_slopes_power_of_2(2 * closest_power_of_2)[0::2][:extra_heads]
-                slopes.extend(extra_slopes)
+        # Causal mask: 只处理下三角部分
+        causal_mask = (rel_pos >= 0).to(attn_weights.dtype)
 
-            return slopes[:num_heads]
+        # 限制相对位置在参数范围内
+        rel_pos = torch.clamp(rel_pos, min=0, max=self.max_bias_length - 1)
 
-    def _init_with_alibi(self):
-        """使用ALiBi模式初始化bias矩阵"""
-        slopes = self._get_alibi_slopes(self.num_heads)
+        # 直接使用高级索引从learnable_bias_diagonals中获取对应的bias值
+        # learnable_bias_diagonals: [num_heads, max_bias_length]
+        # rel_pos: [seq_len_q, seq_len_k]        # 结果: [num_heads, seq_len_q, seq_len_k]
+        bias_values = self.learnable_bias_diagonals[:, rel_pos]
 
-        # 创建相对位置矩阵
-        positions = torch.arange(self.max_bias_length, dtype=torch.float32)
-        relative_positions = positions.unsqueeze(0) - positions.unsqueeze(1)  # [max_bias_length, max_bias_length]
+        # 应用causal mask（上三角部分设为0）
+        bias_values = bias_values * causal_mask
 
-        # 为每个头设置初始bias
-        with torch.no_grad():
-            for head_idx, slope in enumerate(slopes):
-                # ALiBi bias = -slope * |relative_position|
-                alibi_bias = -torch.abs(relative_positions) * slope
-                self.learnable_bias.data[head_idx] = alibi_bias
+        # 扩展到batch维度并相加
+        # [num_heads, seq_len_q, seq_len_k] -> [1, num_heads, seq_len_q, seq_len_k] -> [batch_size, num_heads, seq_len_q, seq_len_k]
+        bias_values = bias_values.unsqueeze(0).expand(batch_size, -1, -1, -1)
 
-    def get_learnable_bias(self, seq_len_q, seq_len_k):
-        """获取指定序列长度的可学习bias"""
-        # 确保不超过最大长度
-        seq_len_q = min(seq_len_q, self.max_bias_length)
-        seq_len_k = min(seq_len_k, self.max_bias_length)
-
-        # 截取相应大小的bias矩阵
-        return self.learnable_bias[:, :seq_len_q, :seq_len_k]
-
-
-    def visualize_learned_bias(self, head_indices=None, seq_len=64):
-        """可视化学习后的bias矩阵"""
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        if head_indices is None:
-            # 默认显示前4个头
-            head_indices = list(range(min(4, self.num_heads)))
-
-        num_heads_to_show = len(head_indices)
-
-        # 创建图表
-        fig, axes = plt.subplots(2, num_heads_to_show, figsize=(5 * num_heads_to_show, 10))
-        if num_heads_to_show == 1:
-            axes = axes.reshape(2, 1)
-
-        with torch.no_grad():
-            # 获取学习后的bias
-            learned_bias = self.learnable_bias[:, :seq_len, :seq_len].cpu().numpy()
-
-            # 计算初始的ALiBi bias作为对比
-            slopes = self._get_alibi_slopes(self.num_heads)
-            positions = np.arange(seq_len)
-            relative_positions = positions[:, np.newaxis] - positions[np.newaxis, :]
-
-            for idx, head_idx in enumerate(head_indices):
-                # 显示学习后的bias
-                ax1 = axes[0, idx]
-                im1 = ax1.imshow(learned_bias[head_idx], cmap='RdBu_r', aspect='auto', vmin=-10, vmax=10)
-                ax1.set_title(f'Learned Bias - Head {head_idx}')
-                ax1.set_xlabel('Key Position')
-                ax1.set_ylabel('Query Position')
-                plt.colorbar(im1, ax=ax1)
-
-                # 显示与初始ALiBi的差异
-                alibi_bias = -np.abs(relative_positions) * slopes[head_idx]
-                diff = learned_bias[head_idx] - alibi_bias
-
-                ax2 = axes[1, idx]
-                im2 = ax2.imshow(diff, cmap='RdBu_r', aspect='auto')
-                ax2.set_title(f'Difference from ALiBi - Head {head_idx}')
-                ax2.set_xlabel('Key Position')
-                ax2.set_ylabel('Query Position')
-                plt.colorbar(im2, ax=ax2)
-
-        plt.suptitle('Learned Position Bias Matrices', fontsize=14)
-        plt.tight_layout()
-        plt.show()
-
-    def get_bias_statistics(self):
-        """获取bias矩阵的统计信息"""
-        with torch.no_grad():
-            print(f"Softmax Offsets for all {self.num_heads} heads:")
-            for i in range(self.num_heads):
-                print(f"  Head {i:2d}: {self.softmax_offset[i].item():+.6f}")
+        return attn_weights + bias_values
 
     def forward(
             self,
@@ -237,39 +162,8 @@ class SWAttention(nn.Module):
         if self.qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
 
-        # equivalent to cu_seqlens in `flash_attn`
-        cu_seqlens = kwargs.get('cu_seqlens', None)
-
-        seqlen_offset, max_seqlen = 0, q_len
-        if past_key_values is not None:
-            seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
-            max_seqlen = q.shape[1] + seqlen_offset
-
-            if attention_mask is not None:
-                # to deliminate the offsets of padding tokens
-                seqlen_offset = seqlen_offset + prepare_lens_from_mask(attention_mask) - attention_mask.shape[-1]
-                max_seqlen = q.shape[1] + max(seqlen_offset)
-
-        if self.max_position_embeddings is not None:
-            max_seqlen = max(max_seqlen, self.max_position_embeddings)
-        # q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen, cu_seqlens=cu_seqlens)
-
-        if past_key_values is not None:
-            cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
-            k_cached, v_cached = past_key_values.update(
-                attn_state=(k.flatten(-2, -1), v.flatten(-2, -1)),
-                layer_idx=self.layer_idx,
-                offset=q_len,
-                cache_kwargs=dict(window_size=self.window_size)
-            )['attn_state']
-            if cache_has_content:
-                k, v = k_cached, v_cached
-                k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
-                v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
-
-        # Regular attention implementation (no flash attention)
-        # Reshape for attention computation: (B, T, num_heads, head_dim) -> (B, num_heads, T, head_dim)
-        q = q.transpose(1, 2)
+            # Regular attention implementation (no flash attention)
+        # Reshape for attention computation: (B, T, num_heads, head_dim) -> (B, num_heads, T, head_dim)        q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
@@ -278,33 +172,32 @@ class SWAttention(nn.Module):
         v = repeat_kv(v, self.num_kv_groups)
 
         # Compute attention scores
-        attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+        attn_scores = torch.matmul(q, k.transpose(2, 3)) * self.scaling
 
         # 应用可学习的位置bias
         if self.use_learnable_bias:
-            seq_len_q = q.size(-2)
-            seq_len_k = k.size(-2)
-            learnable_bias = self.get_learnable_bias(seq_len_q, seq_len_k)
-            # 扩展bias以匹配batch size: [num_heads, seq_q, seq_k] -> [batch, num_heads, seq_q, seq_k]
-            learnable_bias = learnable_bias.unsqueeze(0).expand(batch_size, -1, -1, -1)
-            attn_weights = attn_weights + learnable_bias
+            attn_scores = self.apply_learnable_bias_efficient(attn_scores)
 
-        # Apply attention mask if provided
+            # Apply attention mask if provided
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, :k.shape[-2]]
-            attn_weights = attn_weights + causal_mask - 0.1
+            attn_scores = attn_scores + causal_mask
 
-        # Apply softmax with float32 for numerical stability
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            # 小于0的score设置成-inf (使用可微分的方式)
+        # 使用大的负值代替-inf，保持梯度流动
+        attn_scores = torch.where(attn_scores < 0, attn_scores - 1e9, attn_scores)
 
-        # 应用每个头独立的偏移值
-        # self.softmax_offset 形状: [num_heads]
-        # 需要扩展为: [1, num_heads, 1, 1] 以匹配 attn_weights 的形状 [batch, num_heads, seq_q, seq_k]
-        offset = self.softmax_offset.view(1, self.num_heads, 1, 1)
-        attn_weights = attn_weights + offset
-        attn_weights = F.relu(attn_weights)
+        # Apply softmax with normalization bias for each head
+        # 计算exp(scores)
+        attn_scores_exp = torch.exp(attn_scores - attn_scores.max(dim=-1, keepdim=True)[0])  # 数值稳定性
 
-        # attn_weights = torch.sigmoid(attn_weights)
+        # 添加归一化偏置到分母
+        # self.softmax_norm_bias 形状: [num_heads]
+        # 扩展为: [1, num_heads, 1, 1] 以匹配 attn_scores_exp 的形状 [batch, num_heads, seq_q, seq_k]        norm_bias = self.softmax_norm_bias.view(1, self.num_heads, 1, 1)
+        denominator = attn_scores_exp.sum(dim=-1, keepdim=True) + torch.exp(norm_bias)  # 分母加上exp(bias)
+
+        # 计算归一化的attention weights
+        attn_weights = (attn_scores_exp / denominator).to(q.dtype)
 
         attentions = attn_weights
 
@@ -315,8 +208,5 @@ class SWAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, q_len, -1)
         o = self.o_proj(attn_output)
-
-        # if not output_attentions:
-        #     attentions = None
 
         return o, attentions, past_key_values

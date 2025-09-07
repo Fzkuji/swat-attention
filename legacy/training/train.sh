@@ -179,8 +179,8 @@ cp -r configs $path
 cp -r flame   $path
 cp -r ../fla $path
 
-export TRANSFORMERS_OFFLINE=1
-export HF_DATASETS_OFFLINE=1
+# export TRANSFORMERS_OFFLINE=1
+# export HF_DATASETS_OFFLINE=1
 if [ "$date" == "" ]; then
   date=$(date +%Y%m%d%H%M)
 fi
