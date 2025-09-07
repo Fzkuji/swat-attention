@@ -46,6 +46,58 @@ except ImportError:
 logger = logging.get_logger(__name__)
 
 
+class DoGParameters(nn.Module):
+    """DoG bias参数模块"""
+    def __init__(self, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        # 7个参数: A1, s1, c1, A2, s2, c2, offset
+        self.params = nn.Parameter(torch.randn(num_heads, 7, dtype=torch.float32))
+        self._init_parameters()
+    
+    def _init_parameters(self):
+        with torch.no_grad():
+            # A1, A2: 振幅参数
+            self.params[:, 0] = torch.randn(self.num_heads) * 0.01  # A1
+            self.params[:, 3] = torch.randn(self.num_heads) * 0.01  # A2
+            
+            # s1, s2: 标准差参数
+            self.params[:, 1] = torch.abs(torch.randn(self.num_heads)) * 5.0  # s1
+            self.params[:, 4] = torch.abs(torch.randn(self.num_heads)) * 10.0  # s2
+            
+            # c1, c2: 中心位置
+            self.params[:, 2] = torch.randn(self.num_heads) * 2.0 + 3.0  # c1
+            self.params[:, 5] = torch.randn(self.num_heads) * 8.0 + 2.0  # c2
+            
+            # offset: 偏置
+            self.params[:, 6] = torch.randn(self.num_heads) * 0.001  # offset
+
+    def forward(self):
+        """返回转换后的DoG参数，确保s1和s2为正值"""
+        transformed = self.params.clone()
+        # 使用softplus确保s1和s2为正值
+        transformed[:, 1] = F.softplus(self.params[:, 1])  # s1
+        transformed[:, 4] = F.softplus(self.params[:, 4])  # s2
+        return transformed
+    
+    def extra_repr(self) -> str:
+        return f"num_heads={self.num_heads}, params_shape={tuple(self.params.shape)}"
+
+
+class AttentionSinks(nn.Module):
+    """Attention sink参数模块"""
+    def __init__(self, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.sinks = nn.Parameter(torch.zeros(num_heads))
+    
+    def forward(self):
+        return self.sinks
+    
+    def extra_repr(self) -> str:
+        return f"num_heads={self.num_heads}, sinks_shape={tuple(self.sinks.shape)}"
+
+
 class SWAttention(nn.Module):
 
     def __init__(
@@ -90,34 +142,9 @@ class SWAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=self.qkv_bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
-        # 初始化DoG bias参数和attention sinks
-        self._init_dog_parameters()
-
-    def _init_dog_parameters(self):
-        """初始化DoG bias参数和attention sinks"""
-        # DoG参数: 每个头有7个参数 (A1, s1, c1, A2, s2, c2, offset)
-        # 形状: [num_heads, 7]
-        self.dog_params = nn.Parameter(torch.randn(self.num_heads, 7, dtype=torch.float32))
-
-        # 初始化DoG参数
-        with torch.no_grad():
-            # A1, A2: 振幅参数，初始化为小的随机值
-            self.dog_params[:, 0] = torch.randn(self.num_heads) * 0.01  # A1
-            self.dog_params[:, 3] = torch.randn(self.num_heads) * 0.01  # A2
-
-            # s1, s2: 标准差，需要保持正值
-            self.dog_params[:, 1] = torch.abs(torch.randn(self.num_heads)) * 5.0  # s1
-            self.dog_params[:, 4] = torch.abs(torch.randn(self.num_heads)) * 10.0  # s2
-
-            # c1, c2: 中心位置
-            self.dog_params[:, 2] = torch.randn(self.num_heads) * 2.0 + 3.0  # c1
-            self.dog_params[:, 5] = torch.randn(self.num_heads) * 8.0 + 2.0  # c2
-
-            # offset: 偏置
-            self.dog_params[:, 6] = torch.randn(self.num_heads) * 0.001  # offset
-
-        # Attention sinks: 每个头一个可学习的sink值
-        self.attention_sinks = nn.Parameter(torch.zeros(self.num_heads))
+        # 初始化DoG bias参数和attention sinks（作为子模块）
+        self.dog_parameters = DoGParameters(self.num_heads)
+        self.attention_sinks_module = AttentionSinks(self.num_heads)
 
     def get_dog_parameters(self):
         """获取DoG参数"""
@@ -154,14 +181,10 @@ class SWAttention(nn.Module):
         k_dog = k
         v_dog = v
 
-        # Create a transformed version of DoG parameters for the forward pass.
-        # This keeps the original parameters unconstrained and maintains the gradient flow.
-        dog_params_transformed = self.dog_params.clone()
-
-        # Apply softplus to s1 and s2 indices (1 and 4) to ensure they are positive.
-        # Adding a small epsilon for numerical stability is a good practice.
-        dog_params_transformed[:, 1] = F.softplus(self.dog_params[:, 1])  # s1
-        dog_params_transformed[:, 4] = F.softplus(self.dog_params[:, 4])  # s2
+        # 获取转换后的DoG参数和attention sinks
+        # DoGParameters.forward()会自动应用softplus转换
+        dog_params_transformed = self.dog_parameters()
+        attention_sinks = self.attention_sinks_module()
 
         # 设置参数
         start_q = torch.tensor([0], dtype=torch.int32, device=hidden_states.device)
@@ -169,7 +192,7 @@ class SWAttention(nn.Module):
         # 调用DoG attention (注意: autograd.Function.apply不支持关键字参数)
         attn_output = attention(
             q_dog, k_dog, v_dog,
-            self.attention_sinks,
+            attention_sinks,
             dog_params_transformed,
             self.scaling,
             self.window_size_for_bias,
