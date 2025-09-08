@@ -39,6 +39,7 @@ class SWATConfig(PretrainedConfig):
         fuse_linear_cross_entropy: bool = False,
         use_l2warp: bool = False,
         vocab_size: int = 32000,
+        max_bias_length: int = 1024,
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -66,6 +67,7 @@ class SWATConfig(PretrainedConfig):
         self.fuse_linear_cross_entropy = fuse_linear_cross_entropy
         self.use_l2warp = use_l2warp
         self.vocab_size = vocab_size
+        self.max_bias_length = max_bias_length
 
         if fuse_cross_entropy and fuse_linear_cross_entropy:
             raise ValueError(

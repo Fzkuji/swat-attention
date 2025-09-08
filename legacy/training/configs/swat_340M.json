@@ -14,5 +14,6 @@
     "norm_eps": 1e-06,
     "tie_word_embeddings": false,
     "use_cache": false,
-    "vocab_size": 32000
+    "vocab_size": 32000,
+    "max_bias_length": 512
 }
