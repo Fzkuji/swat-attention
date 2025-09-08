@@ -120,31 +120,20 @@ class SWAttention(nn.Module):
     def apply_learnable_bias_efficient(self, attn_weights):
         """高效地应用对角线 bias，使用GPU并行操作，避免大内存占用"""
         batch_size, num_heads, seq_len_q, seq_len_k = attn_weights.shape
-
-        # 创建相对位置索引矩阵 [seq_len_q, seq_len_k]
-        q_pos = torch.arange(seq_len_q, device=attn_weights.device, dtype=torch.long)
-        k_pos = torch.arange(seq_len_k, device=attn_weights.device, dtype=torch.long)
-        rel_pos = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)
-
-        # Causal mask: 只处理下三角部分
-        causal_mask = (rel_pos >= 0).to(attn_weights.dtype)
-
-        # 限制相对位置在参数范围内
-        rel_pos = torch.clamp(rel_pos, min=0, max=self.max_bias_length - 1)
-
-        # 直接使用高级索引从learnable_bias_diagonals中获取对应的bias值
-        # learnable_bias_diagonals: [num_heads, max_bias_length]
-        # rel_pos: [seq_len_q, seq_len_k]        # 结果: [num_heads, seq_len_q, seq_len_k]
-        bias_values = self.learnable_bias_diagonals[:, rel_pos]
-
-        # 应用causal mask（上三角部分设为0）
-        bias_values = bias_values * causal_mask
-
-        # 扩展到batch维度并相加
-        # [num_heads, seq_len_q, seq_len_k] -> [1, num_heads, seq_len_q, seq_len_k] -> [batch_size, num_heads, seq_len_q, seq_len_k]
-        bias_values = bias_values.unsqueeze(0).expand(batch_size, -1, -1, -1)
-
-        return attn_weights + bias_values
+        
+        # 一次性创建相对位置矩阵
+        rel_pos = torch.arange(seq_len_q, device=attn_weights.device)[:, None] - \
+                  torch.arange(seq_len_k, device=attn_weights.device)[None, :]
+        
+        # 创建有效位置mask (causal + 距离限制)
+        valid_mask = (0 <= rel_pos) & (rel_pos < self.max_bias_length)
+        
+        # 限制索引范围并获取bias值
+        indices = rel_pos.clamp(0, self.max_bias_length - 1)
+        bias = self.learnable_bias_diagonals[:, indices] * valid_mask.to(attn_weights.dtype)
+        
+        # 直接广播加到attention weights上
+        return attn_weights + bias[None, :, :, :]
 
     def forward(
             self,
