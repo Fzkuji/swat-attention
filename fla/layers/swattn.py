@@ -16,7 +16,9 @@ from transformers.utils import logging
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """  
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
@@ -119,7 +121,8 @@ class SWAttention(nn.Module):
         """高效地应用对角线 bias，使用GPU并行操作，避免大内存占用"""
         batch_size, num_heads, seq_len_q, seq_len_k = attn_weights.shape
 
-        # 创建相对位置索引矩阵 [seq_len_q, seq_len_k]        q_pos = torch.arange(seq_len_q, device=attn_weights.device, dtype=torch.long)
+        # 创建相对位置索引矩阵 [seq_len_q, seq_len_k]
+        q_pos = torch.arange(seq_len_q, device=attn_weights.device, dtype=torch.long)
         k_pos = torch.arange(seq_len_k, device=attn_weights.device, dtype=torch.long)
         rel_pos = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)
 
@@ -162,8 +165,9 @@ class SWAttention(nn.Module):
         if self.qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
 
-            # Regular attention implementation (no flash attention)
-        # Reshape for attention computation: (B, T, num_heads, head_dim) -> (B, num_heads, T, head_dim)        q = q.transpose(1, 2)
+        # Regular attention implementation (no flash attention)
+        # Reshape for attention computation: (B, T, num_heads, head_dim) -> (B, num_heads, T, head_dim)
+        q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
@@ -193,7 +197,8 @@ class SWAttention(nn.Module):
 
         # 添加归一化偏置到分母
         # self.softmax_norm_bias 形状: [num_heads]
-        # 扩展为: [1, num_heads, 1, 1] 以匹配 attn_scores_exp 的形状 [batch, num_heads, seq_q, seq_k]        norm_bias = self.softmax_norm_bias.view(1, self.num_heads, 1, 1)
+        # 扩展为: [1, num_heads, 1, 1] 以匹配 attn_scores_exp 的形状 [batch, num_heads, seq_q, seq_k]
+        norm_bias = self.softmax_norm_bias.view(1, self.num_heads, 1, 1)
         denominator = attn_scores_exp.sum(dim=-1, keepdim=True) + torch.exp(norm_bias)  # 分母加上exp(bias)
 
         # 计算归一化的attention weights

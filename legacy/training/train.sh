@@ -90,7 +90,7 @@ if [ "$checkpoint" != "" ]; then
   params+=" --resume_from_checkpoint $checkpoint"
 fi
 if [ "$WANDB_DISABLED" != "true" ]; then
-  params+=" --report_to none \
+  params+=" --report_to wandb \
   --run_name $type.$(basename $path)"
 else
   params+=" --report_to none"
@@ -179,11 +179,12 @@ cp -r configs $path
 cp -r flame   $path
 cp -r ../fla $path
 
-# export TRANSFORMERS_OFFLINE=1
-# export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
 if [ "$date" == "" ]; then
   date=$(date +%Y%m%d%H%M)
 fi
+export WANDB_MODE=offline          # 添加这行
 export WANDB_RESUME=allow
 export WANDB_NAME="$type.$(basename $path)"
 export WANDB_PROJECT=$project
