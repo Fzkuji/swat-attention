@@ -216,18 +216,37 @@ class SWATModel(SWATPreTrainedModel):
         next_cache = None
 
         if attention_mask is None:
-            # Prepare 4D causal attention mask
+            # Create binary causal attention mask (1 = can attend, 0 = cannot attend)
             batch_size, seq_length = inputs_embeds.shape[:2]
             past_key_values_length = past_key_values.get_seq_length() if past_key_values is not None else 0
-
-            # Create causal mask with sliding window support
-            attention_mask = _prepare_4d_causal_attention_mask(
-                attention_mask,
-                (batch_size, seq_length),
-                inputs_embeds,
-                past_key_values_length,
-                sliding_window=self.config.window_size
+            
+            # Create a lower triangular matrix for causal mask
+            device = inputs_embeds.device
+            dtype = inputs_embeds.dtype
+            
+            # Total sequence length including past
+            total_seq_len = seq_length + past_key_values_length
+            
+            # Create causal mask: lower triangular matrix
+            causal_mask = torch.tril(
+                torch.ones(total_seq_len, total_seq_len, device=device, dtype=dtype)
             )
+            
+            # Apply sliding window if specified
+            if self.config.window_size is not None and self.config.window_size > 0:
+                # Create a band matrix for sliding window
+                # Only allow attention within the window (i - j < window_size)
+                indices = torch.arange(total_seq_len, device=device)
+                distance = indices.unsqueeze(0) - indices.unsqueeze(1)  # [total_seq_len, total_seq_len]
+                window_mask = (distance < self.config.window_size) & (distance >= 0)
+                causal_mask = causal_mask * window_mask.to(dtype)
+            
+            # Extract the relevant part of the mask for current sequence
+            # We only need the last seq_length rows (queries) and all columns (keys)
+            causal_mask = causal_mask[-seq_length:, :]
+            
+            # Expand to 4D: (seq_length, total_seq_len) -> (batch_size, 1, seq_length, total_seq_len)
+            attention_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
 
         for layer in self.layers:
             if output_hidden_states:

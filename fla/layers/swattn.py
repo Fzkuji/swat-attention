@@ -95,8 +95,8 @@ class SWAttention(nn.Module):
             self._init_learnable_position_bias()
 
             # 每个头的softmax归一化偏置（加到分母上）
-        # 初始化为0，这样初始时softmax行为正常（和为1）
-        self.softmax_norm_bias = nn.Parameter(torch.zeros(self.num_heads))
+        # 初始化为0，保持标准softmax行为
+        self.softmax_offset = nn.Parameter(torch.full((self.num_heads,), -0.01))
 
     def _init_learnable_position_bias(self):
         """初始化可学习的位置bias参数，每个头都有独立的对角线参数（仅用于causal attention）"""
@@ -171,27 +171,16 @@ class SWAttention(nn.Module):
         if self.use_learnable_bias:
             attn_scores = self.apply_learnable_bias_efficient(attn_scores)
 
-            # Apply attention mask if provided
+        # Apply attention mask if provided
         if attention_mask is not None:
+            # attention_mask should be a binary mask: 1 = can attend, 0 = cannot attend
             causal_mask = attention_mask[:, :, :, :k.shape[-2]]
-            attn_scores = attn_scores + causal_mask
+            # Use masked_fill: where mask is 0, set scores to -inf
+            attn_scores = attn_scores.masked_fill(causal_mask == 0, float('-inf'))
 
-            # 小于0的score设置成-inf (使用可微分的方式)
-        # 使用大的负值代替-inf，保持梯度流动
-        attn_scores = torch.where(attn_scores < 0, attn_scores - 1e9, attn_scores)
-
-        # Apply softmax with normalization bias for each head
-        # 计算exp(scores)
-        attn_scores_exp = torch.exp(attn_scores - attn_scores.max(dim=-1, keepdim=True)[0])  # 数值稳定性
-
-        # 添加归一化偏置到分母
-        # self.softmax_norm_bias 形状: [num_heads]
-        # 扩展为: [1, num_heads, 1, 1] 以匹配 attn_scores_exp 的形状 [batch, num_heads, seq_q, seq_k]
-        norm_bias = self.softmax_norm_bias.view(1, self.num_heads, 1, 1)
-        denominator = attn_scores_exp.sum(dim=-1, keepdim=True) + torch.exp(norm_bias)  # 分母加上exp(bias)
-
-        # 计算归一化的attention weights
-        attn_weights = (attn_scores_exp / denominator).to(q.dtype)
+        offset = F.softplus(self.softmax_offset).view(1, self.num_heads, 1, 1)
+        attn_weights = attn_scores - offset
+        attn_weights = F.relu(attn_weights)
 
         attentions = attn_weights
 
