@@ -96,7 +96,36 @@ class SWAttention(nn.Module):
 
             # 每个头的softmax归一化偏置（加到分母上）
         # 初始化为0，保持标准softmax行为
-        self.softmax_offset = nn.Parameter(torch.full((self.num_heads,), -0.01))
+        self.softmax_offset = nn.Parameter(torch.full((self.num_heads,), 0.0))
+
+        self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
+
+    def apply_learnable_causal_avg_bias(self, attn_scores):
+        """
+        构造带可学习缩放系数的前缀平均分布。
+        """
+        batch_size, num_heads, seq_len_q, seq_len_k = attn_scores.shape
+        device = attn_scores.device
+        dtype = attn_scores.dtype
+
+        # 构造前缀平均矩阵 [seq_len_q, seq_len_k]
+        causal_avg = torch.zeros(seq_len_q, seq_len_k, device=device, dtype=dtype)
+        for i in range(seq_len_q):
+            causal_avg[i, :i + 1] = 1.0 / (i + 1)
+
+        # 扩展维度 [1, 1, seq_len_q, seq_len_k]
+        causal_avg = causal_avg.unsqueeze(0).unsqueeze(0)
+
+        # 每个 head 的可学习缩放因子 [num_heads]
+        offset = torch.abs(self.softmax_offset).view(1, num_heads, 1, 1)
+
+        # 应用缩放
+        causal_avg = causal_avg * offset
+
+        # broadcast 到 batch
+        causal_avg = causal_avg.expand(batch_size, num_heads, -1, -1)
+
+        return causal_avg
 
     def _init_learnable_position_bias(self):
         """初始化可学习的位置bias参数，每个头都有独立的对角线参数（仅用于causal attention）"""
@@ -120,18 +149,18 @@ class SWAttention(nn.Module):
     def apply_learnable_bias_efficient(self, attn_weights):
         """高效地应用对角线 bias，使用GPU并行操作，避免大内存占用"""
         batch_size, num_heads, seq_len_q, seq_len_k = attn_weights.shape
-        
+
         # 一次性创建相对位置矩阵
         rel_pos = torch.arange(seq_len_q, device=attn_weights.device)[:, None] - \
                   torch.arange(seq_len_k, device=attn_weights.device)[None, :]
-        
+
         # 创建有效位置mask (causal + 距离限制)
         valid_mask = (0 <= rel_pos) & (rel_pos < self.max_bias_length)
-        
+
         # 限制索引范围并获取bias值
         indices = rel_pos.clamp(0, self.max_bias_length - 1)
         bias = self.learnable_bias_diagonals[:, indices] * valid_mask.to(attn_weights.dtype)
-        
+
         # 直接广播加到attention weights上
         return attn_weights + bias[None, :, :, :]
 
@@ -153,6 +182,23 @@ class SWAttention(nn.Module):
 
         if self.qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
+
+        # equivalent to cu_seqlens in `flash_attn`
+        cu_seqlens = kwargs.get('cu_seqlens', None)
+
+        seqlen_offset, max_seqlen = 0, q_len
+        if past_key_values is not None:
+            seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
+            max_seqlen = q.shape[1] + seqlen_offset
+
+            if attention_mask is not None:
+                # to deliminate the offsets of padding tokens
+                seqlen_offset = seqlen_offset + prepare_lens_from_mask(attention_mask) - attention_mask.shape[-1]
+                max_seqlen = q.shape[1] + max(seqlen_offset)
+
+        if self.max_position_embeddings is not None:
+            max_seqlen = max(max_seqlen, self.max_position_embeddings)
+        q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen, cu_seqlens=cu_seqlens)
 
         # Regular attention implementation (no flash attention)
         # Reshape for attention computation: (B, T, num_heads, head_dim) -> (B, num_heads, T, head_dim)
@@ -178,13 +224,26 @@ class SWAttention(nn.Module):
             # Use masked_fill: where mask is 0, set scores to -inf
             attn_scores = attn_scores.masked_fill(causal_mask == 0, float('-inf'))
 
-        offset = F.softplus(self.softmax_offset).view(1, self.num_heads, 1, 1)
-        attn_weights = attn_scores - offset
-        attn_weights = F.relu(attn_weights)
+        # Apply softmax with float32 for numerical stability
+        attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+
+        # 取绝对值确保非负
+        offset = torch.abs(self.softmax_offset + 1).view(1, self.num_heads, 1, 1)
+
+        # 每个位置的 adaptive offset
+        positions = torch.arange(attn_weights.shape[-1], device=attn_weights.device)
+        num_visible_tokens = positions.unsqueeze(0) + 1
+        num_visible_tokens = num_visible_tokens.view(1, 1, -1, 1)
+        adaptive_offset = offset / num_visible_tokens.float()
+
+        # 应用 offset + ReLU
+        attn_weights = F.relu(attn_weights - adaptive_offset)
 
         attentions = attn_weights
 
         # Apply attention to values
+        # 确保 attn_weights 和 v dtype 一致
+        attn_weights = attn_weights.to(v.dtype)
         attn_output = torch.matmul(attn_weights, v)
 
         # Reshape back: (B, num_heads, T, head_dim) -> (B, T, num_heads, head_dim) -> (B, T, hidden_size)
