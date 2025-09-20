@@ -90,9 +90,9 @@ class SWAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=self.qkv_bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
-        # 初始化可学习的位置bias矩阵
+        # 初始化 ALiBi 斜率（每个 head 不同）
         if self.use_learnable_bias:
-            self._init_learnable_position_bias()
+            self._init_alibi_slopes()
 
             # 每个头的softmax归一化偏置（加到分母上）
         # 初始化为0，保持标准softmax行为
@@ -127,41 +127,74 @@ class SWAttention(nn.Module):
 
         return causal_avg
 
-    def _init_learnable_position_bias(self):
-        """初始化可学习的位置bias参数，每个头都有独立的对角线参数（仅用于causal attention）"""
-        # 创建可学习的对角线参数：[num_heads, max_bias_length]
-        # 存储主对角线和所有下对角线的值
-        self.learnable_bias_diagonals = nn.Parameter(
-            torch.zeros(self.num_heads, self.max_bias_length)
-        )
+    def _init_alibi_slopes(self):
+        """初始化 ALiBi 斜率，每个 head 使用不同的斜率"""
+        # 生成 ALiBi 斜率（几何级数）
+        # 对于 num_heads 个 head，斜率为 2^(-8/num_heads), 2^(-16/num_heads), ...
+        slopes = []
+        for i in range(1, self.num_heads + 1):
+            slopes.append(2 ** (-8 * i / self.num_heads))
 
-        # 用很小的随机值初始化 (例如正态分布, std=1e-3)
-        nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=1e-3)
-        # # 使用ALiBi初始化
-        # self._init_with_alibi_diagonals()
-
-    def get_learnable_bias(self):
-        """获取可学习的对角线bias参数"""
-        # 直接返回对角线参数
-        # [num_heads, max_bias_length]
-        return self.learnable_bias_diagonals
+        # 保存为 buffer（不是可学习参数）
+        self.register_buffer('alibi_slopes', torch.tensor(slopes, dtype=torch.float32))
 
     def apply_learnable_bias_efficient(self, attn_weights):
-        """高效地应用对角线 bias，使用GPU并行操作，避免大内存占用"""
+        """应用分段式位置 bias：先像 ALiBi 衰减，然后反弹回 0"""
         batch_size, num_heads, seq_len_q, seq_len_k = attn_weights.shape
+        device = attn_weights.device
+        dtype = attn_weights.dtype
 
-        # 一次性创建相对位置矩阵
-        rel_pos = torch.arange(seq_len_q, device=attn_weights.device)[:, None] - \
-                  torch.arange(seq_len_k, device=attn_weights.device)[None, :]
+        # 创建相对位置矩阵（只考虑 causal，即 i >= j）
+        positions_q = torch.arange(seq_len_q, device=device)[:, None]
+        positions_k = torch.arange(seq_len_k, device=device)[None, :]
+        rel_pos = positions_q - positions_k  # [seq_len_q, seq_len_k]
 
-        # 创建有效位置mask (causal + 距离限制)
-        valid_mask = (0 <= rel_pos) & (rel_pos < self.max_bias_length)
+        # 计算绝对距离（用于 bias 计算）
+        distance = torch.abs(rel_pos).float()
 
-        # 限制索引范围并获取bias值
-        indices = rel_pos.clamp(0, self.max_bias_length - 1)
-        bias = self.learnable_bias_diagonals[:, indices] * valid_mask.to(attn_weights.dtype)
+        # 创建 causal mask（只在 i >= j 时应用 bias）
+        causal_mask = (rel_pos >= 0).float().unsqueeze(0)  # [1, seq_len_q, seq_len_k]
 
-        # 直接广播加到attention weights上
+        # For layer 0, use standard alibi
+        if self.layer_idx == 0:
+            m_h = self.alibi_slopes.to(dtype=dtype).view(num_heads, 1, 1)
+            bias = -m_h * distance.unsqueeze(0)
+        else:
+            # Vectorized implementation for other layers
+            h = torch.arange(num_heads, device=device, dtype=dtype)
+
+            # 关键点定义
+            D1 = 10 + h
+            D2 = 100 + 10 * h
+
+            # New slope calculation
+            # max absolute bias value for head h is (num_heads - h) / num_heads
+            # this is reached at distance D1 = 10 + h
+            # slope m_h = max_abs_bias / D1
+            max_bias_values = (self.num_heads - h) / self.num_heads
+            m_h = (max_bias_values / D1).view(num_heads, 1, 1)
+
+            D1 = D1.view(num_heads, 1, 1)
+            D2 = D2.view(num_heads, 1, 1)
+
+            distance_expanded = distance.unsqueeze(0)  # [1, seq_len_q, seq_len_k]
+
+            # 第一段：0 <= d <= D1
+            mask1 = (distance_expanded <= D1).float()
+            bias = -m_h * distance_expanded * mask1
+
+            # 第二段：D1 < d < D2，线性回升到 0
+            mask2 = ((distance_expanded > D1) & (distance_expanded < D2)).float()
+            lowest_point = -m_h * D1
+            interpolation = 1.0 - (distance_expanded - D1) / (D2 - D1)
+            bias = bias + lowest_point * interpolation * mask2
+
+            # 第三段：d >= D2，bias = 0 (already handled)
+
+        # 应用 causal mask（只在下三角应用）
+        bias = bias * causal_mask
+
+        # 将 bias 广播并加到 attention weights
         return attn_weights + bias[None, :, :, :]
 
     def forward(
