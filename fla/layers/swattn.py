@@ -129,11 +129,11 @@ class SWAttention(nn.Module):
 
     def _init_alibi_slopes(self):
         """初始化 ALiBi 斜率，每个 head 使用不同的斜率"""
-        # 生成 ALiBi 斜率（几何级数）
-        # 对于 num_heads 个 head，斜率为 2^(-8/num_heads), 2^(-16/num_heads), ...
+        # 生成均匀分布的 ALiBi 斜率
+        # 第 i 个 head 的斜率为 1 / (250 * i)
         slopes = []
         for i in range(1, self.num_heads + 1):
-            slopes.append(2 ** (-8 * i / self.num_heads))
+            slopes.append(1.0 / (250.0 * i))
 
         # 保存为 buffer（不是可学习参数）
         self.register_buffer('alibi_slopes', torch.tensor(slopes, dtype=torch.float32))
@@ -160,36 +160,40 @@ class SWAttention(nn.Module):
             m_h = self.alibi_slopes.to(dtype=dtype).view(num_heads, 1, 1)
             bias = -m_h * distance.unsqueeze(0)
         else:
-            # Vectorized implementation for other layers
             h = torch.arange(num_heads, device=device, dtype=dtype)
+            # 分段点
+            D0 = 1  # 第1个token
+            D1 = 10 + h  # 第(10+head_id)个token
+            D2 = 80 + 4 * h  # 第(80+4*head_id)个token
 
-            # 关键点定义
-            D1 = 10 + h
-            D2 = 100 + 10 * h
-
-            # New slope calculation
-            # max absolute bias value for head h is (num_heads - h) / num_heads
-            # this is reached at distance D1 = 10 + h
-            # slope m_h = max_abs_bias / D1
-            max_bias_values = (self.num_heads - h) / self.num_heads
-            m_h = (max_bias_values / D1).view(num_heads, 1, 1)
-
+            D0 = D0
             D1 = D1.view(num_heads, 1, 1)
             D2 = D2.view(num_heads, 1, 1)
 
             distance_expanded = distance.unsqueeze(0)  # [1, seq_len_q, seq_len_k]
 
-            # 第一段：0 <= d <= D1
-            mask1 = (distance_expanded <= D1).float()
-            bias = -m_h * distance_expanded * mask1
+            # 起始和终止值
+            start_bias = (1 - h / num_heads).view(num_heads, 1, 1)
+            end_bias = (-1 + h / num_heads).view(num_heads, 1, 1)
 
-            # 第二段：D1 < d < D2，线性回升到 0
-            mask2 = ((distance_expanded > D1) & (distance_expanded < D2)).float()
-            lowest_point = -m_h * D1
-            interpolation = 1.0 - (distance_expanded - D1) / (D2 - D1)
-            bias = bias + lowest_point * interpolation * mask2
+            # 第一段：D0 <= d <= D1，线性下降
+            mask1 = ((distance_expanded >= D0) & (distance_expanded <= D1)).float()
+            slope1 = (end_bias - start_bias) / (D1 - D0)
+            bias1 = start_bias + slope1 * (distance_expanded - D0)
+            bias1 = bias1 * mask1
 
-            # 第三段：d >= D2，bias = 0 (already handled)
+            # 第二段：D1 < d <= D2，线性回升到0
+            mask2 = ((distance_expanded > D1) & (distance_expanded <= D2)).float()
+            slope2 = (0 - end_bias) / (D2 - D1)
+            bias2 = end_bias + slope2 * (distance_expanded - D1)
+            bias2 = bias2 * mask2
+
+            # 第三段：d < D0 或 d > D2，bias=0
+            mask3 = ((distance_expanded < D0) | (distance_expanded > D2)).float()
+            bias3 = torch.zeros_like(distance_expanded)
+            bias3 = bias3 * mask3
+
+            bias = bias1 + bias2 + bias3
 
         # 应用 causal mask（只在下三角应用）
         bias = bias * causal_mask
