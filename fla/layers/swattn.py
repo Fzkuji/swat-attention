@@ -28,6 +28,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 from fla.layers.utils import pad_input, unpad_input
 from fla.modules import RMSNorm, RotaryEmbedding
+from fla.modules.activations import sigmoid, sparsemax, entmax
 from fla.ops.utils.index import prepare_lens_from_mask
 
 if TYPE_CHECKING:
@@ -60,6 +61,7 @@ class SWAttention(nn.Module):
             layer_idx: int = None,
             use_learnable_bias: bool = True,  # 是否使用可学习的位置bias
             max_bias_length: int = 1024,  # bias矩阵的最大尺寸
+            attention_normalization: str = "softmax",  # normalization type: softmax, sigmoid, sparsemax, entmax
     ):
         super().__init__()
 
@@ -82,6 +84,7 @@ class SWAttention(nn.Module):
         self.layer_idx = layer_idx
         self.use_learnable_bias = use_learnable_bias
         self.max_bias_length = max_bias_length
+        self.attention_normalization = attention_normalization
 
         # No longer requiring flash attention
         # Don't pre-allocate mask to save memory
@@ -224,20 +227,35 @@ class SWAttention(nn.Module):
             # Use masked_fill: where mask is 0, set scores to -inf
             attn_scores = attn_scores.masked_fill(causal_mask == 0, float('-inf'))
 
-        # Apply softmax with float32 for numerical stability
-        attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        # Apply normalization based on attention_normalization parameter
+        if self.attention_normalization == "softmax":
+            # Standard softmax normalization
+            attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
 
-        # 取绝对值确保非负
-        offset = torch.abs(self.softmax_offset + 1).view(1, self.num_heads, 1, 1)
+            # Apply adaptive offset (only for softmax)
+            # 取绝对值确保非负
+            offset = torch.abs(self.softmax_offset + 1).view(1, self.num_heads, 1, 1)
 
-        # 每个位置的 adaptive offset
-        positions = torch.arange(attn_weights.shape[-1], device=attn_weights.device)
-        num_visible_tokens = positions.unsqueeze(0) + 1
-        num_visible_tokens = num_visible_tokens.view(1, 1, -1, 1)
-        adaptive_offset = offset / num_visible_tokens.float()
+            # 每个位置的 adaptive offset
+            positions = torch.arange(attn_weights.shape[-1], device=attn_weights.device)
+            num_visible_tokens = positions.unsqueeze(0) + 1
+            num_visible_tokens = num_visible_tokens.view(1, 1, -1, 1)
+            adaptive_offset = offset / num_visible_tokens.float()
 
-        # 应用 offset + ReLU
-        attn_weights = F.relu(attn_weights - adaptive_offset)
+            # 应用 offset + ReLU
+            attn_weights = F.relu(attn_weights - adaptive_offset)
+
+        elif self.attention_normalization == "sigmoid":
+            # Sigmoid attention: no competition between tokens
+            attn_weights = sigmoid(attn_scores.float()).to(q.dtype)
+        elif self.attention_normalization == "sparsemax":
+            # Sparsemax: sparse alternative to softmax
+            attn_weights = sparsemax(attn_scores.float(), dim=-1).to(q.dtype)
+        elif self.attention_normalization == "entmax":
+            # Entmax-1.5: balanced sparsity
+            attn_weights = entmax(attn_scores.float(), alpha=1.5, dim=-1).to(q.dtype)
+        else:
+            raise ValueError(f"Unknown attention_normalization: {self.attention_normalization}")
 
         attentions = attn_weights
 

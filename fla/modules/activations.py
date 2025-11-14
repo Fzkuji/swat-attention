@@ -536,6 +536,203 @@ swiglu = SwiGLUFunction.apply
 swiglu_linear = SwiGLULinearFunction.apply
 
 
+def _make_ix_like(x, dim):
+    """Create an index tensor along the specified dimension."""
+    d = x.size(dim)
+    rho = torch.arange(1, d + 1, device=x.device, dtype=x.dtype)
+    view = [1] * x.dim()
+    view[0] = -1
+    return rho.view(view).transpose(0, dim)
+
+
+def _threshold_and_support(z, dim=-1):
+    """
+    Compute the threshold and support size for sparsemax.
+
+    This is the core computation for sparsemax: we sort the input,
+    compute cumulative sums, and find the threshold value.
+    """
+    sorted_z, _ = torch.sort(z, descending=True, dim=dim)
+    z_cumsum = torch.cumsum(sorted_z, dim=dim) - 1
+    k = _make_ix_like(z, dim)
+    support = k * sorted_z > z_cumsum
+
+    k_z = support.sum(dim=dim, keepdim=True)
+    tau_z = z_cumsum.gather(dim, k_z - 1) / k_z.to(z.dtype)
+    return tau_z, k_z
+
+
+def sparsemax_fwd(x, dim=-1):
+    """
+    Sparsemax activation function (forward pass).
+
+    Sparsemax is a sparse alternative to softmax:
+    - Returns sparse probability distributions (many zeros)
+    - Equivalent to projection onto the probability simplex
+    - Can be seen as entmax with α=2
+
+    Reference: "From Softmax to Sparsemax: A Sparse Model of Attention and Multi-Label Classification"
+    https://arxiv.org/abs/1602.02068
+    """
+    tau_z, _ = _threshold_and_support(x, dim=dim)
+    output = torch.clamp(x - tau_z, min=0)
+    return output
+
+
+def sparsemax_bwd(output, grad_output, dim=-1):
+    """
+    Sparsemax backward pass.
+
+    The gradient is computed based on the support of the output
+    (i.e., which elements are non-zero).
+    """
+    support = output > 0
+    v_hat = (grad_output * support.to(grad_output.dtype)).sum(dim=dim, keepdim=True) / support.sum(dim=dim, keepdim=True).to(grad_output.dtype)
+    grad_input = support.to(grad_output.dtype) * (grad_output - v_hat)
+    return grad_input
+
+
+class SparsemaxFunction(torch.autograd.Function):
+    """
+    Sparsemax activation function with autograd support.
+    """
+
+    @staticmethod
+    def forward(ctx, x, dim=-1):
+        output = sparsemax_fwd(x, dim=dim)
+        ctx.save_for_backward(output)
+        ctx.dim = dim
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output, = ctx.saved_tensors
+        grad_input = sparsemax_bwd(output, grad_output, dim=ctx.dim)
+        return grad_input, None
+
+
+sparsemax = SparsemaxFunction.apply
+
+
+def _entmax_threshold_and_support(x, alpha=1.5, dim=-1):
+    """
+    Core computation for entmax: computing the threshold via bisection.
+
+    Entmax is a family of sparse attention mechanisms parameterized by α:
+    - α = 1: softmax (dense)
+    - α = 1.5: entmax-1.5 (moderately sparse)
+    - α = 2: sparsemax (very sparse)
+    """
+    def p_alpha(x, alpha):
+        """Compute p(x) = max(x, 0)^(1/(alpha-1))"""
+        return torch.pow(torch.clamp(x, min=0), 1.0 / (alpha - 1.0))
+
+    x_sorted, _ = torch.sort(x, descending=True, dim=dim)
+
+    rho = _make_ix_like(x, dim)
+    mean = x_sorted.cumsum(dim=dim) / rho
+    mass = rho * torch.pow(torch.clamp(x_sorted - mean, min=0), alpha - 1.0)
+
+    found = (mass.cumsum(dim=dim) - 1.0) < torch.pow(torch.clamp(x_sorted - mean, min=0), alpha - 1.0) * rho
+
+    rho_star = found.sum(dim=dim, keepdim=True)
+    threshold = x_sorted.gather(dim, rho_star - 1)
+
+    return threshold, rho_star
+
+
+def entmax_fwd(x, alpha=1.5, dim=-1):
+    """
+    Entmax activation function (forward pass).
+
+    Entmax is a family of normalizations that generalizes softmax and sparsemax:
+    - α = 1.0: equivalent to softmax
+    - α = 1.5: entmax-1.5 (moderately sparse, good balance)
+    - α = 2.0: equivalent to sparsemax (very sparse)
+
+    The parameter α controls the sparsity of the output distribution.
+
+    Reference: "Adaptively Sparse Transformers"
+    https://arxiv.org/abs/1909.00015
+    """
+    if alpha == 1.0:
+        return F.softmax(x, dim=dim)
+
+    if alpha == 2.0:
+        return sparsemax_fwd(x, dim=dim)
+
+    # General case: 1 < alpha < 2
+    threshold, _ = _entmax_threshold_and_support(x, alpha=alpha, dim=dim)
+    output = torch.pow(torch.clamp(x - threshold, min=0), 1.0 / (alpha - 1.0))
+
+    # Normalize to sum to 1
+    output = output / output.sum(dim=dim, keepdim=True)
+
+    return output
+
+
+def entmax_bwd(x, output, grad_output, alpha=1.5, dim=-1):
+    """
+    Entmax backward pass.
+    """
+    if alpha == 1.0:
+        # Softmax gradient
+        gppr = grad_output * output
+        grad_input = gppr - output * gppr.sum(dim=dim, keepdim=True)
+        return grad_input
+
+    if alpha == 2.0:
+        return sparsemax_bwd(output, grad_output, dim=dim)
+
+    # General case
+    support = output > 0
+    d_output = torch.where(
+        support,
+        grad_output * torch.pow(output, 2.0 - alpha),
+        torch.zeros_like(grad_output)
+    )
+
+    val = d_output.sum(dim=dim, keepdim=True) / support.sum(dim=dim, keepdim=True).to(d_output.dtype)
+    grad_input = torch.where(support, d_output - val, torch.zeros_like(d_output))
+
+    return grad_input
+
+
+class EntmaxFunction(torch.autograd.Function):
+    """
+    Entmax activation function with autograd support.
+    """
+
+    @staticmethod
+    def forward(ctx, x, alpha=1.5, dim=-1):
+        output = entmax_fwd(x, alpha=alpha, dim=dim)
+        ctx.save_for_backward(x, output)
+        ctx.alpha = alpha
+        ctx.dim = dim
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, output = ctx.saved_tensors
+        grad_input = entmax_bwd(x, output, grad_output, alpha=ctx.alpha, dim=ctx.dim)
+        return grad_input, None, None
+
+
+def entmax(x, alpha=1.5, dim=-1):
+    """
+    Entmax activation function.
+
+    Args:
+        x: Input tensor
+        alpha: Sparsity parameter (1.0=softmax, 1.5=entmax-1.5, 2.0=sparsemax)
+        dim: Dimension along which to apply entmax
+
+    Returns:
+        Tensor with same shape as input, normalized along dim
+    """
+    return EntmaxFunction.apply(x, alpha, dim)
+
+
 ACT2FN = {
     'relu': F.relu,
     'sigmoid': sigmoid,

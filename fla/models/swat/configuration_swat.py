@@ -40,6 +40,7 @@ class SWATConfig(PretrainedConfig):
         use_l2warp: bool = False,
         vocab_size: int = 32000,
         max_bias_length: int = 1024,
+        attention_normalization: str = "softmax",
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -68,6 +69,7 @@ class SWATConfig(PretrainedConfig):
         self.use_l2warp = use_l2warp
         self.vocab_size = vocab_size
         self.max_bias_length = max_bias_length
+        self.attention_normalization = attention_normalization
 
         if fuse_cross_entropy and fuse_linear_cross_entropy:
             raise ValueError(

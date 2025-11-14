@@ -55,6 +55,7 @@ class SWATBlock(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
             layer_idx=layer_idx,
             max_bias_length=config.max_bias_length,
+            attention_normalization=config.attention_normalization,
         )
 
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
