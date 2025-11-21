@@ -28,7 +28,19 @@ def main():
         logger.info("Add pad token: {}".format(tokenizer.pad_token))
     if args.from_config:
         logger.info("All model params are randomly initialized for from-scratch training.")
-        model = AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(args.model_name_or_path))
+        # Load config from JSON file directly to avoid network access
+        import os
+        if os.path.isfile(args.model_name_or_path) and args.model_name_or_path.endswith('.json'):
+            import json
+            logger.info(f"Loading config from JSON file: {args.model_name_or_path}")
+            with open(args.model_name_or_path, 'r') as f:
+                config_dict = json.load(f)
+            # Import the specific config class based on model_type
+            from fla.models.swat.configuration_swat import SWATConfig
+            config = SWATConfig(**config_dict)
+        else:
+            config = AutoConfig.from_pretrained(args.model_name_or_path)
+        model = AutoModelForCausalLM.from_config(config)
     else:
         logger.info(f"Loading pretrained checkpoint {args.model_name_or_path}")
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
