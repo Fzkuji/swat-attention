@@ -28,15 +28,7 @@ def main():
         logger.info("Add pad token: {}".format(tokenizer.pad_token))
     if args.from_config:
         logger.info("All model params are randomly initialized for from-scratch training.")
-        # Check if model_name_or_path is a JSON file or a directory
-        import os
-        if os.path.isfile(args.model_name_or_path) and args.model_name_or_path.endswith('.json'):
-            logger.info(f"Loading config from JSON file: {args.model_name_or_path}")
-            config = AutoConfig.from_pretrained(args.model_name_or_path, local_files_only=True, trust_remote_code=True)
-        else:
-            logger.info(f"Loading config from directory: {args.model_name_or_path}")
-            config = AutoConfig.from_pretrained(args.model_name_or_path, local_files_only=True, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_config(config)
+        model = AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(args.model_name_or_path))
     else:
         logger.info(f"Loading pretrained checkpoint {args.model_name_or_path}")
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
