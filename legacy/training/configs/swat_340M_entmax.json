@@ -15,6 +15,6 @@
     "tie_word_embeddings": false,
     "use_cache": false,
     "vocab_size": 32000,
-    "max_bias_length": 512,
+    "use_learnable_bias": false,
     "attention_normalization": "entmax"
 }

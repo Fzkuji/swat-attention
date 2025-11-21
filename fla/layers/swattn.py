@@ -232,7 +232,7 @@ class SWAttention(nn.Module):
             # Standard softmax normalization
             attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
 
-            # Apply adaptive offset (only for softmax)
+            # Apply adaptive offset (optional, controlled by softmax_offset parameter)
             # 取绝对值确保非负
             offset = torch.abs(self.softmax_offset + 1).view(1, self.num_heads, 1, 1)
 

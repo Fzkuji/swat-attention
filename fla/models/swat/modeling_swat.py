@@ -54,6 +54,7 @@ class SWATBlock(nn.Module):
             rope_theta=config.rope_theta,
             max_position_embeddings=config.max_position_embeddings,
             layer_idx=layer_idx,
+            use_learnable_bias=config.use_learnable_bias,
             max_bias_length=config.max_bias_length,
             attention_normalization=config.attention_normalization,
         )
