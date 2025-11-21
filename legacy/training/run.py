@@ -28,18 +28,7 @@ def main():
         logger.info("Add pad token: {}".format(tokenizer.pad_token))
     if args.from_config:
         logger.info("All model params are randomly initialized for from-scratch training.")
-        # Handle JSON config files directly to avoid network access in offline mode
-        import os
-        import json
-        if os.path.exists(args.model_name_or_path) and args.model_name_or_path.endswith('.json'):
-            logger.info(f"Loading config from JSON file: {args.model_name_or_path}")
-            with open(args.model_name_or_path, 'r') as f:
-                config_dict = json.load(f)
-            from fla.models.swat.configuration_swat import SWATConfig
-            config = SWATConfig(**config_dict)
-        else:
-            config = AutoConfig.from_pretrained(args.model_name_or_path)
-        model = AutoModelForCausalLM.from_config(config)
+        model = AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(args.model_name_or_path))
     else:
         logger.info(f"Loading pretrained checkpoint {args.model_name_or_path}")
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
