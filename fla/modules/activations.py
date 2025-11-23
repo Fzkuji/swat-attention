@@ -636,6 +636,8 @@ def _entmax_threshold_and_support(x, alpha=1.5, dim=-1):
     found = (mass.cumsum(dim=dim) - 1.0) < torch.pow(torch.clamp(x_sorted - mean, min=0), alpha - 1.0) * rho
 
     rho_star = found.sum(dim=dim, keepdim=True)
+    # Clamp rho_star to valid range [1, x.size(dim)] to prevent out-of-bounds access
+    rho_star = torch.clamp(rho_star, min=1, max=x.size(dim))
     threshold = x_sorted.gather(dim, rho_star - 1)
 
     return threshold, rho_star
