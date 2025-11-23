@@ -249,13 +249,11 @@ class SWAttention(nn.Module):
             # Sigmoid attention: no competition between tokens
             attn_weights = sigmoid(attn_scores.float()).to(q.dtype)
         elif self.attention_normalization == "sparsemax":
-            # Sparsemax: sparse alternative to softmax
-            # Note: apply() doesn't accept keyword arguments, use positional args
-            attn_weights = sparsemax(attn_scores.float(), -1).to(q.dtype)
+            # Sparsemax: sparse alternative to softmax (standard library)
+            attn_weights = sparsemax(attn_scores.float(), dim=-1).to(q.dtype)
         elif self.attention_normalization == "entmax":
-            # Entmax-1.5: balanced sparsity
-            # Note: apply() doesn't accept keyword arguments, use positional args
-            attn_weights = entmax(attn_scores.float(), 1.5, -1).to(q.dtype)
+            # Entmax-1.5: balanced sparsity (standard library)
+            attn_weights = entmax(attn_scores.float(), dim=-1).to(q.dtype)
         else:
             raise ValueError(f"Unknown attention_normalization: {self.attention_normalization}")
 

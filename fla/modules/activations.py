@@ -9,6 +9,8 @@ import triton.language as tl
 from fla.ops.utils.op import exp, log
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard, is_amd
 
+from entmax import sparsemax as entmax_sparsemax, entmax15
+
 try:
     from torch.distributed.tensor import DTensor
 except (ImportError, AttributeError):
@@ -592,55 +594,45 @@ def sparsemax_bwd(output, grad_output, dim=-1):
     return grad_input
 
 
-class SparsemaxFunction(torch.autograd.Function):
-    """
-    Sparsemax activation function with autograd support.
-    """
-
-    @staticmethod
-    def forward(ctx, x, dim=-1):
-        output = sparsemax_fwd(x, dim=dim)
-        ctx.save_for_backward(output)
-        ctx.dim = dim
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        output, = ctx.saved_tensors
-        grad_input = sparsemax_bwd(output, grad_output, dim=ctx.dim)
-        return grad_input, None
-
-
-sparsemax = SparsemaxFunction.apply
+# Use standard library implementation directly
+sparsemax = entmax_sparsemax
 
 
 def _entmax_threshold_and_support(x, alpha=1.5, dim=-1):
     """
-    Core computation for entmax: computing the threshold via bisection.
+    Core computation for entmax: computing the threshold.
 
-    Entmax is a family of sparse attention mechanisms parameterized by α:
-    - α = 1: softmax (dense)
-    - α = 1.5: entmax-1.5 (moderately sparse)
-    - α = 2: sparsemax (very sparse)
+    Based on the reference implementation from:
+    https://github.com/deep-spin/entmax
     """
-    def p_alpha(x, alpha):
-        """Compute p(x) = max(x, 0)^(1/(alpha-1))"""
-        return torch.pow(torch.clamp(x, min=0), 1.0 / (alpha - 1.0))
-
     x_sorted, _ = torch.sort(x, descending=True, dim=dim)
 
-    rho = _make_ix_like(x, dim)
-    mean = x_sorted.cumsum(dim=dim) / rho
-    mass = rho * torch.pow(torch.clamp(x_sorted - mean, min=0), alpha - 1.0)
+    d = x.size(dim)
+    rho = torch.arange(1, d + 1, device=x.device, dtype=x.dtype)
 
-    found = (mass.cumsum(dim=dim) - 1.0) < torch.pow(torch.clamp(x_sorted - mean, min=0), alpha - 1.0) * rho
+    # Reshape rho to broadcast correctly
+    rho_shape = [1] * x.dim()
+    rho_shape[dim] = -1
+    rho = rho.view(rho_shape)
 
-    rho_star = found.sum(dim=dim, keepdim=True)
-    # Clamp rho_star to valid range [1, x.size(dim)] to prevent out-of-bounds access
-    rho_star = torch.clamp(rho_star, min=1, max=x.size(dim))
-    threshold = x_sorted.gather(dim, rho_star - 1)
+    # Compute cumulative sum and the criterion for each k
+    x_cumsum = x_sorted.cumsum(dim=dim)
 
-    return threshold, rho_star
+    # The key computation: find the support size
+    # For entmax-1.5: rho * (x_sorted - tau) > 0 iff k * x_sorted > sum(x[:k])
+    criterion = rho * x_sorted > x_cumsum - 1.0
+
+    # Find the largest k where the criterion holds
+    rho_star = criterion.long().sum(dim=dim, keepdim=True)
+
+    # Ensure rho_star is at least 1
+    rho_star = torch.clamp(rho_star, min=1)
+
+    # Compute threshold tau
+    tau_sum = x_cumsum.gather(dim, rho_star - 1)
+    tau = (tau_sum - 1.0) / rho_star.to(x.dtype)
+
+    return tau, rho_star
 
 
 def entmax_fwd(x, alpha=1.5, dim=-1):
@@ -700,39 +692,8 @@ def entmax_bwd(x, output, grad_output, alpha=1.5, dim=-1):
     return grad_input
 
 
-class EntmaxFunction(torch.autograd.Function):
-    """
-    Entmax activation function with autograd support.
-    """
-
-    @staticmethod
-    def forward(ctx, x, alpha=1.5, dim=-1):
-        output = entmax_fwd(x, alpha=alpha, dim=dim)
-        ctx.save_for_backward(x, output)
-        ctx.alpha = alpha
-        ctx.dim = dim
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, output = ctx.saved_tensors
-        grad_input = entmax_bwd(x, output, grad_output, alpha=ctx.alpha, dim=ctx.dim)
-        return grad_input, None, None
-
-
-def entmax(x, alpha=1.5, dim=-1):
-    """
-    Entmax activation function.
-
-    Args:
-        x: Input tensor
-        alpha: Sparsity parameter (1.0=softmax, 1.5=entmax-1.5, 2.0=sparsemax)
-        dim: Dimension along which to apply entmax
-
-    Returns:
-        Tensor with same shape as input, normalized along dim
-    """
-    return EntmaxFunction.apply(x, alpha, dim)
+# Use standard library implementation directly
+entmax = entmax15
 
 
 ACT2FN = {
