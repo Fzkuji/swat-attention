@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Modified to use Lazy Attention Triton kernel
 
 from __future__ import annotations
 
@@ -13,17 +14,17 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers.utils import logging
 
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """  
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+# Import Lazy Attention Triton kernel
+try:
+    from adasplash import lazy_attention_triton
+    HAS_LAZY_ATTENTION = True
+except ImportError:
+    warnings.warn(
+        "AdaSplash is not installed. Please install it via `pip install adasplash`",
+        category=ImportWarning
+    )
+    lazy_attention_triton = None
+    HAS_LAZY_ATTENTION = False
 
 
 from fla.layers.utils import pad_input, unpad_input
@@ -32,15 +33,6 @@ from fla.ops.utils.index import prepare_lens_from_mask
 
 if TYPE_CHECKING:
     from fla.models.utils import Cache
-
-try:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-except ImportError:
-    warnings.warn(
-        "Flash Attention is not installed. Please install it via `pip install flash-attn --no-build-isolation`",
-        category=ImportWarning
-    )
-    flash_attn_func = None
 
 logger = logging.get_logger(__name__)
 
@@ -58,10 +50,20 @@ class SWAttention(nn.Module):
             rope_theta: Optional[float] = 10000.,
             max_position_embeddings: Optional[int] = None,
             layer_idx: int = None,
-            use_learnable_bias: bool = True,  # 是否使用可学习的位置bias
-            max_bias_length: int = 1024,  # bias矩阵的最大尺寸
+            use_learnable_bias: bool = True,  # 保留用于兼容性，Lazy Attention 总是使用可学习 bias
+            max_bias_length: int = 1024,  # bias 窗口大小
     ):
         super().__init__()
+
+        if not HAS_LAZY_ATTENTION:
+            raise ImportError("Please install AdaSplash via `pip install adasplash` first")
+
+        # 兼容处理：如果 window_size 为 None，使用 max_bias_length
+        if window_size is None:
+            window_size = max_bias_length
+            logger.warning(
+                f"window_size was not specified, using max_bias_length={max_bias_length} as window_size for Lazy Attention"
+            )
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -72,7 +74,6 @@ class SWAttention(nn.Module):
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.kv_dim = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
         self.qk_norm = qk_norm
 
@@ -80,69 +81,33 @@ class SWAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.layer_idx = layer_idx
-        self.use_learnable_bias = use_learnable_bias
-        self.max_bias_length = max_bias_length
 
-        # No longer requiring flash attention
-        # Don't pre-allocate mask to save memory
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=self.qkv_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=self.qkv_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=self.qkv_bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
-        # 初始化可学习的位置bias矩阵
-        if self.use_learnable_bias:
-            self._init_learnable_position_bias()
+        if qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
 
-        # Elastic-Softmax 的 τ 参数，每个头独立
-        # τ_init = -1，对应论文公式 ReLU(Softmax + τ/i)
+        # Lazy Attention 的可学习参数
+        # 位置 bias: [num_heads, window_size+1]
+        # 注意：这对应原始实现的 learnable_bias_diagonals
+        self.bias = nn.Parameter(torch.zeros(self.num_heads, self.window_size + 1))
+        nn.init.normal_(self.bias, mean=0.0, std=1e-3)
+
+        # Elastic-Softmax 的 τ 参数: [num_heads]
         self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0))
 
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
-
-    def _init_learnable_position_bias(self):
-        """初始化可学习的位置bias参数，每个头都有独立的对角线参数（仅用于causal attention）"""
-        # 创建可学习的对角线参数：[num_heads, max_bias_length]
-        # 存储主对角线和所有下对角线的值
-        self.learnable_bias_diagonals = nn.Parameter(
-            torch.zeros(self.num_heads, self.max_bias_length)
-        )
-
-        # 用很小的随机值初始化 (例如正态分布, std=1e-3)
-        nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=1e-3)
-        # # 使用ALiBi初始化
-        # self._init_with_alibi_diagonals()
-
-    def get_learnable_bias(self):
-        """获取可学习的对角线bias参数"""
-        # 直接返回对角线参数
-        # [num_heads, max_bias_length]
-        return self.learnable_bias_diagonals
-
-    def apply_learnable_bias_efficient(self, attn_weights):
-        """高效地应用对角线 bias，使用GPU并行操作，避免大内存占用"""
-        batch_size, num_heads, seq_len_q, seq_len_k = attn_weights.shape
-
-        # 一次性创建相对位置矩阵
-        rel_pos = torch.arange(seq_len_q, device=attn_weights.device)[:, None] - \
-                  torch.arange(seq_len_k, device=attn_weights.device)[None, :]
-
-        # 创建有效位置mask (causal + 距离限制)
-        valid_mask = (0 <= rel_pos) & (rel_pos < self.max_bias_length)
-
-        # 限制索引范围并获取bias值
-        indices = rel_pos.clamp(0, self.max_bias_length - 1)
-        bias = self.learnable_bias_diagonals[:, indices] * valid_mask.to(attn_weights.dtype)
-
-        # 直接广播加到attention weights上
-        return attn_weights + bias[None, :, :, :]
 
     def forward(
             self,
             hidden_states: torch.Tensor,
             attention_mask: Optional[torch.LongTensor] = None,
             past_key_values: Optional[Cache] = None,
-            output_attentions: bool = True,
+            output_attentions: bool = False,  # Lazy Attention 不返回 attention weights
             use_cache: bool = False,
             **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -171,55 +136,48 @@ class SWAttention(nn.Module):
 
         if self.max_position_embeddings is not None:
             max_seqlen = max(max_seqlen, self.max_position_embeddings)
+
+        # Apply RoPE
         q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen, cu_seqlens=cu_seqlens)
 
-        # Regular attention implementation (no flash attention)
-        # Reshape for attention computation: (B, T, num_heads, head_dim) -> (B, num_heads, T, head_dim)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # Handle GQA (Grouped Query Attention)
+        # Lazy Attention requires all heads to have matching dimensions
+        if self.num_kv_groups > 1:
+            # [B, L, num_kv_heads, D] -> [B, L, num_heads, D]
+            k = k.repeat_interleave(self.num_kv_groups, dim=2)
+            v = v.repeat_interleave(self.num_kv_groups, dim=2)
 
-        # Handle grouped multi-query attention using repeat_kv
-        k = repeat_kv(k, self.num_kv_groups)
-        v = repeat_kv(v, self.num_kv_groups)
+        # Convert shape: [B, L, H, D] -> [B, H, L, D] for Lazy Attention
+        q = rearrange(q, 'b l h d -> b h l d')
+        k = rearrange(k, 'b l h d -> b h l d')
+        v = rearrange(v, 'b l h d -> b h l d')
 
-        # Compute attention scores
-        attn_scores = torch.matmul(q, k.transpose(2, 3)) * self.scaling
-
-        # 应用可学习的位置bias
-        if self.use_learnable_bias:
-            attn_scores = self.apply_learnable_bias_efficient(attn_scores)
-
-        # Apply attention mask if provided
+        # Convert attention_mask to varlen format
+        varlen = None
         if attention_mask is not None:
-            # attention_mask should be a binary mask: 1 = can attend, 0 = cannot attend
-            causal_mask = attention_mask[:, :, :, :k.shape[-2]]
-            # Use masked_fill: where mask is 0, set scores to -inf
-            attn_scores = attn_scores.masked_fill(causal_mask == 0, float('-inf'))
+            # attention_mask: [B, 1, L, L] or [B, L]
+            if attention_mask.dim() == 4:
+                # Extract actual sequence length from causal mask
+                # For each sample, find the last position with 1
+                varlen = (attention_mask[:, 0, 0, :] != 0).sum(dim=-1).to(torch.int32)
+            elif attention_mask.dim() == 2:
+                # [B, L] - directly sum to get actual length
+                varlen = attention_mask.sum(dim=1).to(torch.int32)
 
-        # Apply softmax with float32 for numerical stability
-        attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        # Call Lazy Attention Triton kernel
+        attn_output = lazy_attention_triton(
+            q, k, v,
+            bias=self.bias,
+            tau=self.tau,
+            window_size=self.window_size,
+            varlen=varlen
+        )
 
-        # Elastic-Softmax: ReLU(Softmax(s) + τ/i)
-        # τ 是每个头的可学习参数，i 是 query 位置（能看到的 token 数）
-        tau = self.tau.view(1, self.num_heads, 1, 1)
-        seq_len_q = attn_weights.shape[-2]
-        i_positions = torch.arange(1, seq_len_q + 1, device=attn_weights.device, dtype=attn_weights.dtype)
-        i_positions = i_positions.view(1, 1, -1, 1)  # (1, 1, seq_len_q, 1)
-
-        # 直接按论文公式：ReLU(Softmax + τ/i)
-        attn_weights = F.relu(attn_weights + tau / i_positions)
-
-        attentions = attn_weights
-
-        # Apply attention to values
-        # 确保 attn_weights 和 v dtype 一致
-        attn_weights = attn_weights.to(v.dtype)
-        attn_output = torch.matmul(attn_weights, v)
-
-        # Reshape back: (B, num_heads, T, head_dim) -> (B, T, num_heads, head_dim) -> (B, T, hidden_size)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(batch_size, q_len, -1)
+        # Convert back: [B, H, L, D] -> [B, L, H*D]
+        attn_output = rearrange(attn_output, 'b h l d -> b l (h d)')
         o = self.o_proj(attn_output)
+
+        # Lazy Attention does not return attention weights
+        attentions = None
 
         return o, attentions, past_key_values
