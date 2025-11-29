@@ -159,11 +159,11 @@ class SWAttention(nn.Module):
                 varlen = attention_mask.sum(dim=1).to(torch.int32)
 
         # Call Lazy Attention Triton kernel
+        # window_size is auto-inferred from bias.shape[1]
         attn_output = lazy_attention_triton(
             q, k, v,
             bias=self.learnable_bias_diagonals,
             tau=self.tau,
-            window_size=self.max_bias_length,
             varlen=varlen
         )
 
