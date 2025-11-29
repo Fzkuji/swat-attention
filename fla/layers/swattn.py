@@ -92,7 +92,8 @@ class SWAttention(nn.Module):
         nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=1e-3)
 
         # Elastic-Softmax 的 τ 参数: [num_heads]
-        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0))
+        # Use float32 to avoid gradient underflow with bfloat16 training
+        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0, dtype=torch.float32))
 
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
 
@@ -159,10 +160,11 @@ class SWAttention(nn.Module):
                 varlen = attention_mask.sum(dim=1).to(torch.int32)
 
         # Call Lazy Attention Triton kernel
+        # Convert tau from float32 to model dtype for kernel computation
         attn_output = lazy_attention_triton(
             q, k, v,
             bias=self.learnable_bias_diagonals,
-            tau=self.tau,
+            tau=self.tau.to(q.dtype),
             window_size=self.max_bias_length,
             varlen=varlen
         )
