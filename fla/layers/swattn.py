@@ -94,38 +94,11 @@ class SWAttention(nn.Module):
         if self.use_learnable_bias:
             self._init_learnable_position_bias()
 
-            # 每个头的softmax归一化偏置（加到分母上）
-        # 初始化为0，保持标准softmax行为
-        self.softmax_offset = nn.Parameter(torch.full((self.num_heads,), 0.0))
+        # Elastic-Softmax 的 τ 参数，每个头独立
+        # τ_init = -1，对应论文公式 ReLU(Softmax + τ/i)
+        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0))
 
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
-
-    def apply_learnable_causal_avg_bias(self, attn_scores):
-        """
-        构造带可学习缩放系数的前缀平均分布。
-        """
-        batch_size, num_heads, seq_len_q, seq_len_k = attn_scores.shape
-        device = attn_scores.device
-        dtype = attn_scores.dtype
-
-        # 构造前缀平均矩阵 [seq_len_q, seq_len_k]
-        causal_avg = torch.zeros(seq_len_q, seq_len_k, device=device, dtype=dtype)
-        for i in range(seq_len_q):
-            causal_avg[i, :i + 1] = 1.0 / (i + 1)
-
-        # 扩展维度 [1, 1, seq_len_q, seq_len_k]
-        causal_avg = causal_avg.unsqueeze(0).unsqueeze(0)
-
-        # 每个 head 的可学习缩放因子 [num_heads]
-        offset = torch.abs(self.softmax_offset).view(1, num_heads, 1, 1)
-
-        # 应用缩放
-        causal_avg = causal_avg * offset
-
-        # broadcast 到 batch
-        causal_avg = causal_avg.expand(batch_size, num_heads, -1, -1)
-
-        return causal_avg
 
     def _init_learnable_position_bias(self):
         """初始化可学习的位置bias参数，每个头都有独立的对角线参数（仅用于causal attention）"""
@@ -227,17 +200,15 @@ class SWAttention(nn.Module):
         # Apply softmax with float32 for numerical stability
         attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
 
-        # 取绝对值确保非负
-        offset = torch.abs(self.softmax_offset + 1).view(1, self.num_heads, 1, 1)
+        # Elastic-Softmax: ReLU(Softmax(s) + τ/i)
+        # τ 是每个头的可学习参数，i 是 query 位置（能看到的 token 数）
+        tau = self.tau.view(1, self.num_heads, 1, 1)
+        seq_len_q = attn_weights.shape[-2]
+        i_positions = torch.arange(1, seq_len_q + 1, device=attn_weights.device, dtype=attn_weights.dtype)
+        i_positions = i_positions.view(1, 1, -1, 1)  # (1, 1, seq_len_q, 1)
 
-        # 每个位置的 adaptive offset
-        positions = torch.arange(attn_weights.shape[-1], device=attn_weights.device)
-        num_visible_tokens = positions.unsqueeze(0) + 1
-        num_visible_tokens = num_visible_tokens.view(1, 1, -1, 1)
-        adaptive_offset = offset / num_visible_tokens.float()
-
-        # 应用 offset + ReLU
-        attn_weights = F.relu(attn_weights - adaptive_offset)
+        # 直接按论文公式：ReLU(Softmax + τ/i)
+        attn_weights = F.relu(attn_weights + tau / i_positions)
 
         attentions = attn_weights
 

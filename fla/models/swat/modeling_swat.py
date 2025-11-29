@@ -215,37 +215,39 @@ class SWATModel(SWATPreTrainedModel):
         all_attns = () if output_attentions else None
         next_cache = None
 
-        if attention_mask is None:
-            # Create binary causal attention mask (1 = can attend, 0 = cannot attend)
-            batch_size, seq_length = inputs_embeds.shape[:2]
-            past_key_values_length = past_key_values.get_seq_length() if past_key_values is not None else 0
-            
-            # Create a lower triangular matrix for causal mask
-            device = inputs_embeds.device
-            dtype = inputs_embeds.dtype
-            
-            # Total sequence length including past
-            total_seq_len = seq_length + past_key_values_length
-            
-            # Create causal mask: lower triangular matrix
-            causal_mask = torch.tril(
-                torch.ones(total_seq_len, total_seq_len, device=device, dtype=dtype)
-            )
-            
-            # Apply sliding window if specified
-            if self.config.window_size is not None and self.config.window_size > 0:
-                # Create a band matrix for sliding window
-                # Only allow attention within the window (i - j < window_size)
-                indices = torch.arange(total_seq_len, device=device)
-                distance = indices.unsqueeze(0) - indices.unsqueeze(1)  # [total_seq_len, total_seq_len]
-                window_mask = (distance < self.config.window_size) & (distance >= 0)
-                causal_mask = causal_mask * window_mask.to(dtype)
-            
-            # Extract the relevant part of the mask for current sequence
-            # We only need the last seq_length rows (queries) and all columns (keys)
-            causal_mask = causal_mask[-seq_length:, :]
-            
-            # Expand to 4D: (seq_length, total_seq_len) -> (batch_size, 1, seq_length, total_seq_len)
+        # 处理 attention_mask：支持 2D padding mask 和 4D causal mask
+        batch_size, seq_length = inputs_embeds.shape[:2]
+        past_key_values_length = past_key_values.get_seq_length() if past_key_values is not None else 0
+        device = inputs_embeds.device
+        dtype = inputs_embeds.dtype
+        total_seq_len = seq_length + past_key_values_length
+
+        # 创建 causal mask（下三角矩阵）
+        causal_mask = torch.tril(
+            torch.ones(total_seq_len, total_seq_len, device=device, dtype=dtype)
+        )
+
+        # 如果有 sliding window，应用窗口限制
+        if self.config.window_size is not None and self.config.window_size > 0:
+            indices = torch.arange(total_seq_len, device=device)
+            distance = indices.unsqueeze(0) - indices.unsqueeze(1)
+            window_mask = (distance < self.config.window_size) & (distance >= 0)
+            causal_mask = causal_mask * window_mask.to(dtype)
+
+        # 提取当前序列对应的部分
+        causal_mask = causal_mask[-seq_length:, :]
+
+        # 如果传入了 2D padding mask，需要结合 causal mask
+        if attention_mask is not None and attention_mask.dim() == 2:
+            # attention_mask: [batch, seq_len], 1 = valid, 0 = padding
+            # 扩展为 [batch, 1, 1, total_seq_len] 用于广播
+            padding_mask = attention_mask[:, None, None, :].to(dtype)
+            # 结合 causal mask 和 padding mask
+            # causal_mask: [seq_length, total_seq_len] -> [1, 1, seq_length, total_seq_len]
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+            attention_mask = causal_mask * padding_mask
+        elif attention_mask is None or attention_mask.dim() != 4:
+            # 没有 mask 或不是 4D，使用纯 causal mask
             attention_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
 
         for layer in self.layers:
