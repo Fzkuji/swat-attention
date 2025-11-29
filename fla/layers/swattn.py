@@ -88,13 +88,11 @@ class SWAttention(nn.Module):
         # Lazy Attention 的可学习参数
         # 位置 bias: [num_heads, max_bias_length]
         # 距离范围 [0, max_bias_length)，与原始实现一致
-        # Use float32 to avoid gradient underflow with bfloat16 training
-        self.learnable_bias_diagonals = nn.Parameter(torch.zeros(self.num_heads, self.max_bias_length, dtype=torch.float32))
+        self.learnable_bias_diagonals = nn.Parameter(torch.zeros(self.num_heads, self.max_bias_length))
         nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=1e-3)
 
         # Elastic-Softmax 的 τ 参数: [num_heads]
-        # Use float32 to avoid gradient underflow with bfloat16 training
-        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0, dtype=torch.float32))
+        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0))
 
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
 
@@ -161,11 +159,10 @@ class SWAttention(nn.Module):
                 varlen = attention_mask.sum(dim=1).to(torch.int32)
 
         # Call Lazy Attention Triton kernel
-        # Convert float32 parameters to model dtype for kernel computation
         attn_output = lazy_attention_triton(
             q, k, v,
-            bias=self.learnable_bias_diagonals.to(q.dtype),
-            tau=self.tau.to(q.dtype),
+            bias=self.learnable_bias_diagonals,
+            tau=self.tau,
             window_size=self.max_bias_length,
             varlen=varlen
         )
