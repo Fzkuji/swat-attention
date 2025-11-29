@@ -10,7 +10,7 @@ print("="*80)
 
 torch.manual_seed(42)
 
-B, H, L, D = 1, 1, 4, 8  # 非常小的尺寸
+B, H, L, D = 1, 1, 32, 32  # Triton 要求至少 16x16x16
 device = 'cuda'
 
 # 创建输入
