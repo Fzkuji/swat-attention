@@ -88,13 +88,15 @@ class SWAttention(nn.Module):
         # Lazy Attention 的可学习参数
         # 位置 bias: [num_heads, max_bias_length]
         # 距离范围 [0, max_bias_length)，与原始实现一致
-        self.learnable_bias_diagonals = nn.Parameter(torch.zeros(self.num_heads, self.max_bias_length))
+        # 使用 float32 避免 bf16 精度限制导致小梯度更新被舍入为 0
+        self.learnable_bias_diagonals = nn.Parameter(torch.zeros(self.num_heads, self.max_bias_length, dtype=torch.float32))
         # 增大初始化方差，让初始 attention 有更大差异，帮助 tau 从负值开始训练
         nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=0.02)
 
         # Elastic-Softmax 的 τ 参数: [num_heads]
         # 必须初始化为 -1.0（训练后会变得更小/更负）
-        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0))
+        # 使用 float32 避免 bf16 精度限制导致小梯度更新被舍入为 0
+        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0, dtype=torch.float32))
 
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
 
@@ -162,10 +164,11 @@ class SWAttention(nn.Module):
 
         # Call Lazy Attention Triton kernel
         # window_size is auto-inferred from bias.shape[1]
+        # Convert float32 parameters to model dtype (bf16) for computation
         attn_output = lazy_attention_triton(
             q, k, v,
-            bias=self.learnable_bias_diagonals,
-            tau=self.tau,
+            bias=self.learnable_bias_diagonals.to(q.dtype),
+            tau=self.tau.to(q.dtype),
             varlen=varlen
         )
 
