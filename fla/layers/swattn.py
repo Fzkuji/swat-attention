@@ -58,13 +58,6 @@ class SWAttention(nn.Module):
         if not HAS_LAZY_ATTENTION:
             raise ImportError("Please install AdaSplash via `pip install adasplash` first")
 
-        # 兼容处理：如果 window_size 为 None，使用 max_bias_length
-        if window_size is None:
-            window_size = max_bias_length
-            logger.warning(
-                f"window_size was not specified, using max_bias_length={max_bias_length} as window_size for Lazy Attention"
-            )
-
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         if num_kv_heads is None:
@@ -77,10 +70,11 @@ class SWAttention(nn.Module):
         self.qkv_bias = qkv_bias
         self.qk_norm = qk_norm
 
-        self.window_size = window_size
+        self.window_size = window_size  # 滑动窗口大小（可选）
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.layer_idx = layer_idx
+        self.max_bias_length = max_bias_length  # 可学习bias的最大长度
 
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=self.qkv_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=self.qkv_bias)
@@ -92,9 +86,9 @@ class SWAttention(nn.Module):
             self.k_norm = RMSNorm(self.head_dim)
 
         # Lazy Attention 的可学习参数
-        # 位置 bias: [num_heads, window_size]
-        # 距离范围 [0, window_size)，与原始实现一致
-        self.learnable_bias_diagonals = nn.Parameter(torch.zeros(self.num_heads, self.window_size))
+        # 位置 bias: [num_heads, max_bias_length]
+        # 距离范围 [0, max_bias_length)，与原始实现一致
+        self.learnable_bias_diagonals = nn.Parameter(torch.zeros(self.num_heads, self.max_bias_length))
         nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=1e-3)
 
         # Elastic-Softmax 的 τ 参数: [num_heads]
@@ -169,7 +163,7 @@ class SWAttention(nn.Module):
             q, k, v,
             bias=self.learnable_bias_diagonals,
             tau=self.tau,
-            window_size=self.window_size,
+            window_size=self.max_bias_length,
             varlen=varlen
         )
 
