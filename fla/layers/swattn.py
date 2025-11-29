@@ -92,10 +92,10 @@ class SWAttention(nn.Module):
             self.k_norm = RMSNorm(self.head_dim)
 
         # Lazy Attention 的可学习参数
-        # 位置 bias: [num_heads, window_size+1]
-        # 注意：这对应原始实现的 learnable_bias_diagonals
-        self.bias = nn.Parameter(torch.zeros(self.num_heads, self.window_size + 1))
-        nn.init.normal_(self.bias, mean=0.0, std=1e-3)
+        # 位置 bias: [num_heads, window_size]
+        # 距离范围 [0, window_size)，与原始实现一致
+        self.learnable_bias_diagonals = nn.Parameter(torch.zeros(self.num_heads, self.window_size))
+        nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=1e-3)
 
         # Elastic-Softmax 的 τ 参数: [num_heads]
         self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0))
@@ -167,7 +167,7 @@ class SWAttention(nn.Module):
         # Call Lazy Attention Triton kernel
         attn_output = lazy_attention_triton(
             q, k, v,
-            bias=self.bias,
+            bias=self.learnable_bias_diagonals,
             tau=self.tau,
             window_size=self.window_size,
             varlen=varlen
