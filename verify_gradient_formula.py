@@ -12,9 +12,10 @@ L, D = 8, 4
 tau_val = -1.0
 
 # 创建简单的输入（单个 query）
-scores = torch.randn(L, requires_grad=True, dtype=torch.float32) * 0.5  # [L]
+scores_data = torch.randn(L, dtype=torch.float32) * 0.5
+scores = torch.nn.Parameter(scores_data)  # 使用 Parameter 让它成为叶子节点
 v = torch.randn(L, D, dtype=torch.float32)  # [L, D]
-tau = torch.tensor(tau_val, requires_grad=True, dtype=torch.float32)
+tau = torch.nn.Parameter(torch.tensor(tau_val, dtype=torch.float32))
 
 # 位置 i（这个 query 能看到多少个 token）
 i = L
