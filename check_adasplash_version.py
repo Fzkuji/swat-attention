@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """检查 adasplash 是否使用了最新代码"""
-import adasplash
-import inspect
+import os
 
 print("="*80)
 print("检查 adasplash 版本")
 print("="*80)
 
 # 1. 检查导入路径
+import adasplash
 print(f"\nadasplash 导入路径:")
 print(f"  {adasplash.__file__}")
 
-# 2. 读取源代码检查是否有修复
-from adasplash import lazy_attention_triton as lat_module
-source_file = inspect.getsourcefile(lat_module._lazy_bwd_preprocess_kernel)
-print(f"\n_lazy_bwd_preprocess_kernel 源文件:")
+# 2. 找到 lazy_attention_triton.py 文件
+adasplash_dir = os.path.dirname(adasplash.__file__)
+source_file = os.path.join(adasplash_dir, 'lazy_attention_triton.py')
+print(f"\nlazy_attention_triton.py 路径:")
 print(f"  {source_file}")
 
+if not os.path.exists(source_file):
+    print(f"  ❌ 文件不存在！")
+    exit(1)
+
 # 3. 检查源代码中是否有 p_norm_f32
-source = inspect.getsource(lat_module._lazy_bwd_preprocess_kernel)
+with open(source_file, 'r') as f:
+    source = f.read()
+
 has_fix = 'p_norm_f32' in source
 
 print(f"\n是否包含修复 (p_norm_f32):")
