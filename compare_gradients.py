@@ -38,6 +38,13 @@ for tau_val in tau_values:
     scaling = 1.0 / (D ** 0.5)
     attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scaling
 
+    # Apply bias (scratch 实现方式)
+    rel_pos = torch.arange(L, device=device)[:, None] - torch.arange(L, device=device)[None, :]
+    valid_mask = (0 <= rel_pos) & (rel_pos < 512)
+    indices = rel_pos.clamp(0, 511)
+    bias_matrix = bias_scratch[:, indices] * valid_mask.float()  # [H, L, L]
+    attn_scores = attn_scores + bias_matrix[None, :, :, :]  # [B, H, L, L]
+
     # Causal mask
     causal_mask = torch.tril(torch.ones(L, L, device=device))
     attn_scores = attn_scores.masked_fill(causal_mask[None, None, :, :] == 0, float('-inf'))
@@ -61,7 +68,10 @@ for tau_val in tau_values:
     print(f"  损失:      {loss_scratch.item():.10f}")
     print(f"  tau.grad:  {tau_scratch.grad}")
     print(f"  |tau.grad|: {tau_scratch.grad.abs().sum().item():.10f}")
-    print(f"  |bias.grad|: {bias_scratch.grad.abs().sum().item():.10f}")
+    if bias_scratch.grad is not None:
+        print(f"  |bias.grad|: {bias_scratch.grad.abs().sum().item():.10f}")
+    else:
+        print(f"  |bias.grad|: None (没有梯度！)")
 
     # ========================================================================
     # Flash 实现
@@ -88,7 +98,10 @@ for tau_val in tau_values:
     print(f"  损失:      {loss_flash.item():.10f}")
     print(f"  tau.grad:  {tau_flash.grad}")
     print(f"  |tau.grad|: {tau_flash.grad.abs().sum().item():.10f}")
-    print(f"  |bias.grad|: {bias_flash.grad.abs().sum().item():.10f}")
+    if bias_flash.grad is not None:
+        print(f"  |bias.grad|: {bias_flash.grad.abs().sum().item():.10f}")
+    else:
+        print(f"  |bias.grad|: None (没有梯度！)")
 
     # ========================================================================
     # 对比
@@ -112,12 +125,15 @@ for tau_val in tau_values:
         print(f"    相对: {rel * 100:.2f}%")
 
     # Bias 梯度差异
-    bias_grad_diff = (bias_scratch.grad - bias_flash.grad).abs()
-    print(f"  Bias 梯度差异:")
-    print(f"    绝对: {bias_grad_diff.mean().item():.10f}")
-    if bias_scratch.grad.abs().max() > 1e-8:
-        rel = (bias_grad_diff / (bias_scratch.grad.abs() + 1e-10)).mean().item()
-        print(f"    相对: {rel * 100:.2f}%")
+    if bias_scratch.grad is not None and bias_flash.grad is not None:
+        bias_grad_diff = (bias_scratch.grad - bias_flash.grad).abs()
+        print(f"  Bias 梯度差异:")
+        print(f"    绝对: {bias_grad_diff.mean().item():.10f}")
+        if bias_scratch.grad.abs().max() > 1e-8:
+            rel = (bias_grad_diff / (bias_scratch.grad.abs() + 1e-10)).mean().item()
+            print(f"    相对: {rel * 100:.2f}%")
+    else:
+        print(f"  Bias 梯度差异: 无法对比（某个为 None）")
 
 # ============================================================================
 # 总结
