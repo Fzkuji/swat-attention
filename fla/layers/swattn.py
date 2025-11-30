@@ -94,9 +94,10 @@ class SWAttention(nn.Module):
         nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=0.02)
 
         # Elastic-Softmax 的 τ 参数: [num_heads]
-        # 必须初始化为 -1.0（训练后会变得更小/更负）
+        # 初始化为 -0.5（训练后会变得更小/更负）
+        # 改为 -0.5 而不是 -1.0 是因为 -1.0 时梯度太小（约小76倍），导致训练极慢
         # 使用 float32 避免 bf16 精度限制导致小梯度更新被舍入为 0
-        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0, dtype=torch.float32))
+        self.tau = nn.Parameter(torch.full((self.num_heads,), -0.5, dtype=torch.float32))
 
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
 
