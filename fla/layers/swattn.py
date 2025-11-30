@@ -85,19 +85,17 @@ class SWAttention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim)
             self.k_norm = RMSNorm(self.head_dim)
 
-        # Lazy Attention 的可学习参数
+        # Lazy Attention 的可学习参数（与scratch分支保持一致）
         # 位置 bias: [num_heads, max_bias_length]
-        # 距离范围 [0, max_bias_length)，与原始实现一致
-        # 使用 float32 避免 bf16 精度限制导致小梯度更新被舍入为 0
-        self.learnable_bias_diagonals = nn.Parameter(torch.zeros(self.num_heads, self.max_bias_length, dtype=torch.float32))
-        # 增大初始化方差，让初始 attention 有更大差异，帮助 tau 从负值开始训练
-        nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=0.02)
+        # 距离范围 [0, max_bias_length)
+        self.learnable_bias_diagonals = nn.Parameter(
+            torch.zeros(self.num_heads, self.max_bias_length)
+        )
+        nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=1e-3)
 
         # Elastic-Softmax 的 τ 参数: [num_heads]
-        # 初始化为 -0.5（训练后会变得更小/更负）
-        # 改为 -0.5 而不是 -1.0 是因为 -1.0 时梯度太小（约小76倍），导致训练极慢
-        # 使用 float32 避免 bf16 精度限制导致小梯度更新被舍入为 0
-        self.tau = nn.Parameter(torch.full((self.num_heads,), -0.5, dtype=torch.float32))
+        # τ_init = -1，对应论文公式 ReLU(Softmax + τ/i)
+        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0))
 
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
 
@@ -151,26 +149,13 @@ class SWAttention(nn.Module):
         k = rearrange(k, 'b l h d -> b h l d')
         v = rearrange(v, 'b l h d -> b h l d')
 
-        # Convert attention_mask to varlen format
-        varlen = None
-        if attention_mask is not None:
-            # attention_mask: [B, 1, L, L] or [B, L]
-            if attention_mask.dim() == 4:
-                # Extract actual sequence length from causal mask
-                # For each sample, find the last position with 1
-                varlen = (attention_mask[:, 0, 0, :] != 0).sum(dim=-1).to(torch.int32)
-            elif attention_mask.dim() == 2:
-                # [B, L] - directly sum to get actual length
-                varlen = attention_mask.sum(dim=1).to(torch.int32)
-
         # Call Lazy Attention Triton kernel
-        # window_size is auto-inferred from bias.shape[1]
-        # Convert float32 parameters to model dtype (bf16) for computation
+        # Triton kernel 内部已经实现了 causal mask，不需要传入 varlen
+        # window_size 从 bias.shape[1] 自动推断
         attn_output = lazy_attention_triton(
             q, k, v,
             bias=self.learnable_bias_diagonals.to(q.dtype),
             tau=self.tau.to(q.dtype),
-            varlen=varlen
         )
 
         # Convert back: [B, H, L, D] -> [B, L, H*D]
