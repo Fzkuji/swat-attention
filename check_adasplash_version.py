@@ -27,14 +27,33 @@ with open(source_file, 'r') as f:
 
 has_fix = 'p_norm_f32' in source
 
+# 统计 p_norm_f32 出现次数（应该有 4 次：1次forward + 3次backward）
+p_norm_f32_count = source.count('p_norm_f32 = p_norm.to(tl.float32)')
+p_term_f32_count = source.count('p_term_f32 = p_norm_f32 + tau_term')
+
 print(f"\n是否包含修复 (p_norm_f32):")
 if has_fix:
-    print("  ✅ 是 - 已包含修复")
+    print(f"  ✅ 是 - 已包含修复")
+    print(f"  p_norm_f32 定义出现 {p_norm_f32_count} 次（应为 4 次：1 forward + 3 backward）")
+    print(f"  p_term_f32 定义出现 {p_term_f32_count} 次（应为 4 次）")
+
+    if p_norm_f32_count >= 4 and p_term_f32_count >= 4:
+        print("  ✅ Forward 和 Backward 都已修复")
+    elif p_norm_f32_count >= 3 and p_term_f32_count >= 3:
+        print("  ⚠️ 只有 Backward 修复，Forward 可能还没修复")
+    else:
+        print("  ⚠️ 修复可能不完整")
+
     # 打印相关代码行
+    print("\n关键代码位置:")
     lines = source.split('\n')
     for i, line in enumerate(lines):
-        if 'p_norm_f32' in line or 'p_term_f32' in line or 'mask_relu' in line:
-            print(f"    {i+1}: {line}")
+        if 'p_norm_f32 = p_norm.to(tl.float32)' in line:
+            # 打印上下文
+            print(f"  第 {i+1} 行 (上下文):")
+            for j in range(max(0, i-2), min(len(lines), i+3)):
+                marker = ">>>" if j == i else "   "
+                print(f"    {marker} {j+1}: {lines[j]}")
 else:
     print("  ❌ 否 - 仍是旧版本")
     print("\n需要执行:")
