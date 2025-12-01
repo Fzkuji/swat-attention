@@ -14,13 +14,15 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers.utils import logging
 
-# Import Lazy Attention Triton kernel
+# Import Lazy Attention Triton kernel from flash-lazy-attention repo
+import sys
+sys.path.insert(0, '/home/fzkuji/PycharmProjects/flash-lazy-attention')
 try:
-    from adasplash import lazy_attention_triton
+    from lazy_attention_triton import lazy_attention_triton
     HAS_LAZY_ATTENTION = True
 except ImportError:
     warnings.warn(
-        "AdaSplash is not installed. Please install it via `pip install adasplash`",
+        "flash-lazy-attention is not available. Please check the path.",
         category=ImportWarning
     )
     lazy_attention_triton = None
@@ -56,7 +58,7 @@ class SWAttention(nn.Module):
         super().__init__()
 
         if not HAS_LAZY_ATTENTION:
-            raise ImportError("Please install AdaSplash via `pip install adasplash` first")
+            raise ImportError("flash-lazy-attention is not available. Please check the path.")
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads
