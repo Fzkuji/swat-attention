@@ -74,6 +74,22 @@ class TrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Enable training with variable length inputs."},
     )
+    freeze_lazy_params_after: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Freeze bias/tau parameters in SWAT attention after N steps. "
+                    "This speeds up Triton backward by avoiding atomic_add. "
+                    "Set to None or 0 to disable."
+        },
+    )
+    monitor_lazy_params_every: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Log bias/tau parameter statistics every N steps to monitor convergence. "
+                    "Useful for determining when to freeze parameters. "
+                    "Set to None or 0 to disable."
+        },
+    )
 
 
 def get_train_args():

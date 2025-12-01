@@ -8,6 +8,7 @@ import fla  # noqa
 from flame.data import DataCollatorForLanguageModeling
 from flame.logging import LogCallback, get_logger
 from flame.parser import get_train_args
+from flame.freeze_callback import FreezeLazyParamsCallback, MonitorLazyParamsCallback
 
 logger = get_logger(__name__)
 
@@ -55,12 +56,31 @@ def main():
             'num_decay_steps': args.max_steps * 0.1
         }
 
+    # Callbacks
+    callbacks = [LogCallback()]
+
+    # Monitor lazy attention parameters (bias, tau) to observe convergence
+    monitor_lazy_steps = getattr(args, 'monitor_lazy_params_every', None)
+    if monitor_lazy_steps is not None and monitor_lazy_steps > 0:
+        logger.info(f"Will monitor bias/tau parameters every {monitor_lazy_steps} steps")
+        callbacks.append(MonitorLazyParamsCallback(
+            log_every_n_steps=monitor_lazy_steps,
+            use_wandb=getattr(args, 'report_to', None) == 'wandb',
+        ))
+
+    # For SWAT models: freeze bias/tau after N steps to speed up training
+    # This avoids slow atomic_add operations in Triton backward pass
+    freeze_after_steps = getattr(args, 'freeze_lazy_params_after', None)
+    if freeze_after_steps is not None and freeze_after_steps > 0:
+        logger.info(f"Will freeze bias/tau parameters after {freeze_after_steps} steps")
+        callbacks.append(FreezeLazyParamsCallback(freeze_after_steps=freeze_after_steps))
+
     trainer = Trainer(
         model=model,
         args=args,
         processing_class=tokenizer,
         data_collator=data_collator,
-        callbacks=[LogCallback()],
+        callbacks=callbacks,
         train_dataset=dataset
     )
 
