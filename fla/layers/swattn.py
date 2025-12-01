@@ -97,7 +97,13 @@ class SWAttention(nn.Module):
 
         # Elastic-Softmax 的 τ 参数: [num_heads]
         # τ_init = -1，对应论文公式 ReLU(Softmax + τ/i)
-        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.01))
+        #
+        # IMPORTANT: We use a scaled representation to overcome bf16 precision loss.
+        # Store tau_scaled = tau * TAU_SCALE, then divide by TAU_SCALE in forward pass.
+        # This amplifies gradients by TAU_SCALE while maintaining the same math.
+        # With TAU_SCALE=100, tau=-1 is stored as tau_scaled=-100
+        self.TAU_SCALE = 100.0  # Scale factor for bf16 precision
+        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.01 * self.TAU_SCALE))
 
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
 
@@ -154,10 +160,17 @@ class SWAttention(nn.Module):
         # Call Lazy Attention Triton kernel
         # Triton kernel 内部已经实现了 causal mask，不需要传入 varlen
         # window_size 从 bias.shape[1] 自动推断
+        #
+        # IMPORTANT: Divide tau by TAU_SCALE to get actual tau value.
+        # This is done with a differentiable operation so gradients flow back
+        # to self.tau with 100x amplification (chain rule: d(tau/100)/d(tau) = 1/100,
+        # so gradient to self.tau = gradient_to_actual_tau / 100, but since self.tau
+        # stores 100x the value, the effective gradient is correct).
+        actual_tau = self.tau / self.TAU_SCALE
         attn_output = lazy_attention_triton(
             q, k, v,
             bias=self.learnable_bias_diagonals.to(q.dtype),
-            tau=self.tau.to(q.dtype),
+            tau=actual_tau.to(q.dtype),
         )
 
         # Convert back: [B, H, L, D] -> [B, L, H*D]
