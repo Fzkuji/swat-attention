@@ -6,11 +6,29 @@ Callbacks for lazy attention parameter management:
 """
 
 import torch
+import torch.distributed as dist
 from transformers import TrainerCallback, TrainerControl, TrainerState
 from transformers.training_args import TrainingArguments
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
+
+
+def _is_main_process():
+    """Check if this is the main process in distributed training."""
+    if not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
+
+
+def _unwrap_model(model):
+    """Unwrap model from DeepSpeed/FSDP/DDP wrappers."""
+    # Try common wrapper attributes
+    if hasattr(model, 'module'):
+        return model.module
+    if hasattr(model, '_orig_mod'):
+        return model._orig_mod
+    return model
 
 
 class MonitorLazyParamsCallback(TrainerCallback):
@@ -57,19 +75,23 @@ class MonitorLazyParamsCallback(TrainerCallback):
         if state.global_step % self.log_every_n_steps != 0:
             return
 
-        metrics = self._collect_metrics(model, state.global_step)
+        # Unwrap model for distributed training
+        unwrapped_model = _unwrap_model(model)
+        metrics = self._collect_metrics(unwrapped_model, state.global_step)
 
-        # Log to console
-        self._log_to_console(state.global_step, metrics)
+        # Only log on main process
+        if _is_main_process():
+            # Log to console
+            self._log_to_console(state.global_step, metrics)
 
-        # Log to wandb if available
-        if self.use_wandb:
-            self._log_to_wandb(state.global_step, metrics)
+            # Log to wandb if available
+            if self.use_wandb:
+                self._log_to_wandb(state.global_step, metrics)
 
-        # Log to tensorboard
-        if self.use_tensorboard and hasattr(state, 'log_history'):
-            # Trainer will pick up metrics from state
-            pass
+            # Log to tensorboard
+            if self.use_tensorboard and hasattr(state, 'log_history'):
+                # Trainer will pick up metrics from state
+                pass
 
     def _collect_metrics(self, model, step):
         """Collect bias/tau metrics from all layers."""
@@ -140,17 +162,21 @@ class MonitorLazyParamsCallback(TrainerCallback):
         tau_norm = metrics.get('lazy/tau_norm_mean', 0)
         tau_grad = metrics.get('lazy/tau_grad_norm_mean', 0)
         tau_change = metrics.get('lazy/tau_change_rate_mean', 0)
+        num_layers = len(metrics.get('lazy/bias_norm_mean', [])) if isinstance(metrics.get('lazy/bias_norm_mean'), list) else 0
 
-        logger.info(
-            f"[Step {step}] Lazy params: "
+        # Use print for reliable output (logger.info may be filtered)
+        print(
+            f"\n[Step {step}] Lazy params (found {len(self.prev_bias_params)} layers): "
             f"bias(norm={bias_norm:.4f}, grad={bias_grad:.6f}, change={bias_change:.6f}) "
-            f"tau(norm={tau_norm:.4f}, grad={tau_grad:.6f}, change={tau_change:.6f})"
+            f"tau(norm={tau_norm:.4f}, grad={tau_grad:.6f}, change={tau_change:.6f})",
+            flush=True
         )
 
         # Print convergence hint
         if bias_change < 0.001 and tau_change < 0.001 and step > 100:
-            logger.info(
-                f"  -> Parameters appear stable! Consider freezing at step {step}"
+            print(
+                f"  -> Parameters appear stable! Consider freezing at step {step}",
+                flush=True
             )
 
     def _log_to_wandb(self, step, metrics):
@@ -204,13 +230,16 @@ class FreezeLazyParamsCallback(TrainerCallback):
             return
 
         if state.global_step >= self.freeze_after_steps:
-            self._freeze_lazy_params(model)
+            # Unwrap model for distributed training
+            unwrapped_model = _unwrap_model(model)
+            self._freeze_lazy_params(unwrapped_model)
             self.frozen = True
 
-            if self.verbose:
-                logger.info(
-                    f"[FreezeLazyParamsCallback] Froze bias/tau at step {state.global_step}. "
-                    f"Backward will be much faster now."
+            if self.verbose and _is_main_process():
+                print(
+                    f"\n[FreezeLazyParamsCallback] Froze bias/tau at step {state.global_step}. "
+                    f"Backward will be much faster now.",
+                    flush=True
                 )
 
     def _freeze_lazy_params(self, model):
@@ -230,8 +259,8 @@ class FreezeLazyParamsCallback(TrainerCallback):
                     module.tau.requires_grad = False
                     frozen_count += 1
 
-        if self.verbose:
-            logger.info(f"[FreezeLazyParamsCallback] Froze {frozen_count} parameters")
+        if self.verbose and _is_main_process():
+            print(f"[FreezeLazyParamsCallback] Froze {frozen_count} parameters", flush=True)
 
 
 class TwoStageTrainingCallback(TrainerCallback):
@@ -264,7 +293,8 @@ class TwoStageTrainingCallback(TrainerCallback):
             return
 
         if state.global_step >= self.switch_after_steps:
-            self._switch_to_triton_frozen(model)
+            unwrapped_model = _unwrap_model(model)
+            self._switch_to_triton_frozen(unwrapped_model)
             self.switched = True
 
     def _switch_to_triton_frozen(self, model):
@@ -280,7 +310,8 @@ class TwoStageTrainingCallback(TrainerCallback):
             if hasattr(module, 'use_triton'):
                 module.use_triton = True
 
-        if self.verbose:
-            logger.info(
-                f"[TwoStageTrainingCallback] Switched to Triton mode with frozen bias/tau"
+        if self.verbose and _is_main_process():
+            print(
+                f"[TwoStageTrainingCallback] Switched to Triton mode with frozen bias/tau",
+                flush=True
             )
