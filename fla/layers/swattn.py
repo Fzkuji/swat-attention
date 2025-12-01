@@ -101,26 +101,26 @@ class SWAttention(nn.Module):
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
 
     def _init_learnable_position_bias(self):
-        """初始化可学习的位置bias参数，每个头都有独立的对角线参数（仅用于causal attention）"""
-        # 创建可学习的对角线参数：[num_heads, max_bias_length]
-        # 存储主对角线和所有下对角线的值
-        self.learnable_bias_diagonals = nn.Parameter(
-            torch.zeros(self.num_heads, self.max_bias_length)
-        )
+        """初始化可学习的位置bias参数，使用 nn.Embedding 以获得更快的 backward"""
+        # 使用 Embedding: [max_bias_length, num_heads]
+        # 相比 nn.Parameter 的直接索引，Embedding 的 backward 有专门优化
+        self.bias_embed = nn.Embedding(self.max_bias_length, self.num_heads)
 
         # 用很小的随机值初始化 (例如正态分布, std=1e-3)
-        nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=1e-3)
-        # # 使用ALiBi初始化
-        # self._init_with_alibi_diagonals()
+        nn.init.normal_(self.bias_embed.weight, mean=0.0, std=1e-3)
+
+    @property
+    def learnable_bias_diagonals(self):
+        """兼容性接口：返回 [num_heads, max_bias_length] 形状的 bias"""
+        return self.bias_embed.weight.t()
 
     def get_learnable_bias(self):
         """获取可学习的对角线bias参数"""
-        # 直接返回对角线参数
-        # [num_heads, max_bias_length]
-        return self.learnable_bias_diagonals
+        # 返回 [num_heads, max_bias_length] 形状
+        return self.bias_embed.weight.t()
 
     def apply_learnable_bias_efficient(self, attn_weights):
-        """高效地应用对角线 bias，使用GPU并行操作，避免大内存占用"""
+        """高效地应用对角线 bias，使用 Embedding 加速 backward"""
         batch_size, num_heads, seq_len_q, seq_len_k = attn_weights.shape
 
         # 一次性创建相对位置矩阵
@@ -130,9 +130,10 @@ class SWAttention(nn.Module):
         # 创建有效位置mask (causal + 距离限制)
         valid_mask = (0 <= rel_pos) & (rel_pos < self.max_bias_length)
 
-        # 限制索引范围并获取bias值
+        # 限制索引范围并使用 Embedding 获取 bias 值
         indices = rel_pos.clamp(0, self.max_bias_length - 1)
-        bias = self.learnable_bias_diagonals[:, indices] * valid_mask.to(attn_weights.dtype)
+        # Embedding: [L, L] -> [L, L, num_heads] -> [num_heads, L, L]
+        bias = self.bias_embed(indices).permute(2, 0, 1) * valid_mask.to(attn_weights.dtype)
 
         # 直接广播加到attention weights上
         return attn_weights + bias[None, :, :, :]
