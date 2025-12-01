@@ -127,9 +127,10 @@ class MonitorLazyParamsCallback(TrainerCallback):
             if hasattr(module, 'tau'):
                 param = module.tau
                 metrics['tau_norm'].append(param.data.norm().item())
-                # Get actual tau values (divide by TAU_SCALE if using scaled representation)
+                # Get actual tau values (multiply by TAU_SCALE if using scaled-down representation)
+                # tau_small * TAU_SCALE = actual_tau
                 tau_scale = getattr(module, 'TAU_SCALE', 1.0)
-                actual_tau = param.data.cpu() / tau_scale
+                actual_tau = param.data.cpu() * tau_scale
                 metrics['tau_values'].append(actual_tau.tolist())
 
                 if param.grad is not None:

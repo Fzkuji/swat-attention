@@ -98,12 +98,17 @@ class SWAttention(nn.Module):
         # Elastic-Softmax 的 τ 参数: [num_heads]
         # τ_init = -1，对应论文公式 ReLU(Softmax + τ/i)
         #
-        # IMPORTANT: We use a scaled representation to overcome bf16 precision loss.
-        # Store tau_scaled = tau * TAU_SCALE, then divide by TAU_SCALE in forward pass.
+        # IMPORTANT: We use a scaled-down representation to AMPLIFY gradients.
+        # Store tau_small = tau / TAU_SCALE, then multiply by TAU_SCALE in forward pass.
         # This amplifies gradients by TAU_SCALE while maintaining the same math.
-        # With TAU_SCALE=100, tau=-1 is stored as tau_scaled=-100
-        self.TAU_SCALE = 100.0  # Scale factor for bf16 precision
-        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.01 * self.TAU_SCALE))
+        #
+        # Math: actual_tau = tau_small * TAU_SCALE
+        # Gradient: d(loss)/d(tau_small) = d(loss)/d(actual_tau) * TAU_SCALE
+        #
+        # With TAU_SCALE=100, tau=-1 is stored as tau_small=-0.0101
+        # Gradient to tau_small is 100x larger, overcoming bf16 precision loss!
+        self.TAU_SCALE = 100.0  # Gradient amplification factor
+        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.01 / self.TAU_SCALE))
 
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
 
@@ -161,12 +166,11 @@ class SWAttention(nn.Module):
         # Triton kernel 内部已经实现了 causal mask，不需要传入 varlen
         # window_size 从 bias.shape[1] 自动推断
         #
-        # IMPORTANT: Divide tau by TAU_SCALE to get actual tau value.
-        # This is done with a differentiable operation so gradients flow back
-        # to self.tau with 100x amplification (chain rule: d(tau/100)/d(tau) = 1/100,
-        # so gradient to self.tau = gradient_to_actual_tau / 100, but since self.tau
-        # stores 100x the value, the effective gradient is correct).
-        actual_tau = self.tau / self.TAU_SCALE
+        # IMPORTANT: Multiply tau_small by TAU_SCALE to get actual tau value.
+        # This amplifies gradients by TAU_SCALE (chain rule):
+        #   d(loss)/d(tau_small) = d(loss)/d(actual_tau) * TAU_SCALE
+        # With 100x gradient amplification, updates are visible in bf16!
+        actual_tau = self.tau * self.TAU_SCALE
         attn_output = lazy_attention_triton(
             q, k, v,
             bias=self.learnable_bias_diagonals.to(q.dtype),
