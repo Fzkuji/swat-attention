@@ -97,7 +97,7 @@ class SWAttention(nn.Module):
 
         # Elastic-Softmax 的 τ 参数: [num_heads]
         # τ_init = -1，对应论文公式 ReLU(Softmax + τ/i)
-        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0))
+        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.01))
 
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
 
