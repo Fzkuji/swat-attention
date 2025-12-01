@@ -41,6 +41,8 @@ echo "ip:               ${ip:=}"
 echo "port:             ${port:=}"
 echo "nodes:            ${nodes:=1}"
 echo "gpus:             ${gpus:=8}"
+echo "freeze_lazy:      ${freeze_lazy:=0}"
+echo "monitor_lazy:     ${monitor_lazy:=0}"
 
 params="--model_name_or_path $model \
     --tokenizer $tokenizer \
@@ -94,6 +96,12 @@ if [ "$WANDB_DISABLED" != "true" ]; then
   --run_name $type.$(basename $path)"
 else
   params+=" --report_to none"
+fi
+if [ $freeze_lazy -gt 0 ]; then
+  params+=" --freeze_lazy_params_after $freeze_lazy"
+fi
+if [ $monitor_lazy -gt 0 ]; then
+  params+=" --monitor_lazy_params_every $monitor_lazy"
 fi
 
 echo "Launching training..."
