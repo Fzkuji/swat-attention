@@ -164,11 +164,16 @@ class MonitorLazyParamsCallback(TrainerCallback):
         tau_change = metrics.get('lazy/tau_change_rate_mean', 0)
         num_layers = len(metrics.get('lazy/bias_norm_mean', [])) if isinstance(metrics.get('lazy/bias_norm_mean'), list) else 0
 
+        # Get first layer's tau values for debugging
+        tau_values = metrics.get('lazy/tau_layer0', [])
+        tau_str = str(tau_values[:4]) if tau_values else "N/A"  # Show first 4 heads
+
         # Use print for reliable output (logger.info may be filtered)
         print(
             f"\n[Step {step}] Lazy params (found {len(self.prev_bias_params)} layers): "
             f"bias(norm={bias_norm:.4f}, grad={bias_grad:.6f}, change={bias_change:.6f}) "
-            f"tau(norm={tau_norm:.4f}, grad={tau_grad:.6f}, change={tau_change:.6f})",
+            f"tau(norm={tau_norm:.4f}, grad={tau_grad:.6f}, change={tau_change:.6f}) "
+            f"tau_vals={tau_str}",
             flush=True
         )
 
