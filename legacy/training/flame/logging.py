@@ -98,15 +98,16 @@ class LogCallback(TrainerCallback, ExportableState):
         if raw_loss is not None and args.world_size > 1:
             actual_loss = raw_loss / args.world_size
             # Override wandb's incorrect loss with corrected value
+            # WandbCallback logs as "train/loss", so we override that
             try:
                 import wandb
                 if wandb.run is not None:
-                    # Use define_metric to ensure we can overwrite
-                    wandb.log({"loss": actual_loss}, step=state.global_step)
+                    wandb.log({"train/loss": actual_loss}, step=state.global_step)
             except ImportError:
                 pass
             # Also update state.log_history for other uses
             state.log_history[-1]["loss"] = actual_loss
+            logs["loss"] = actual_loss
         else:
             actual_loss = raw_loss
 
