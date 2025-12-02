@@ -105,10 +105,9 @@ class SWAttention(nn.Module):
         # Math: actual_tau = tau_small * TAU_SCALE
         # Gradient: d(loss)/d(tau_small) = d(loss)/d(actual_tau) * TAU_SCALE
         #
-        # With TAU_SCALE=100, tau=-1 is stored as tau_small=-0.01
-        # Gradient to tau_small is 100x larger, helping with bf16 precision.
-        # Note: Use lazy_lr_mult=1.0 to avoid 1000x total amplification.
-        self.TAU_SCALE = 100.0  # Gradient amplification factor
+        # With TAU_SCALE=10, tau=-1 is stored as tau_small=-0.1
+        # Gradient to tau_small is 10x larger, helping with bf16 precision.
+        self.TAU_SCALE = 10.0  # Gradient amplification factor
         self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0 / self.TAU_SCALE))
 
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
