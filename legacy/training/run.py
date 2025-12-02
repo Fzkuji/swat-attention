@@ -4,6 +4,7 @@ from datasets import load_from_disk
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
                           Trainer)
 from transformers.integrations import WandbCallback
+from transformers.trainer_callback import ProgressCallback
 import torch
 
 import fla  # noqa
@@ -149,39 +150,46 @@ def main():
         train_dataset=dataset
     )
 
-    # Reorder callbacks: LossCorrectionCallback must run BEFORE LogCallback and WandbCallback
-    # HuggingFace Trainer adds default callbacks (including WandbCallback) before user callbacks
-    # So we need to manually reorder them
+    # Reorder callbacks: LossCorrectionCallback must run BEFORE all callbacks that use logs
+    # including ProgressCallback (console output), LogCallback, and WandbCallback
+    # HuggingFace Trainer adds default callbacks before user callbacks, so we need to reorder
     #
-    # Target order: ... -> LossCorrectionCallback -> LogCallback -> WandbCallback
+    # Target order: ... -> LossCorrectionCallback -> ProgressCallback -> LogCallback -> WandbCallback
     loss_correction_cb = None
+    progress_callback = None
     log_callback = None
     wandb_callback = None
     for cb in trainer.callback_handler.callbacks:
         if isinstance(cb, LossCorrectionCallback):
             loss_correction_cb = cb
+        if isinstance(cb, ProgressCallback):
+            progress_callback = cb
         if isinstance(cb, LogCallback):
             log_callback = cb
         if isinstance(cb, WandbCallback):
             wandb_callback = cb
 
-    # Remove all three and re-add in correct order
+    # Remove all four and re-add in correct order
     if loss_correction_cb is not None:
         trainer.remove_callback(LossCorrectionCallback)
+    if progress_callback is not None:
+        trainer.remove_callback(ProgressCallback)
     if log_callback is not None:
         trainer.remove_callback(LogCallback)
     if wandb_callback is not None:
         trainer.remove_callback(WandbCallback)
 
-    # Re-add in order: LossCorrectionCallback -> LogCallback -> WandbCallback
+    # Re-add in order: LossCorrectionCallback -> ProgressCallback -> LogCallback -> WandbCallback
     if loss_correction_cb is not None:
         trainer.add_callback(loss_correction_cb)
+    if progress_callback is not None:
+        trainer.add_callback(progress_callback)
     if log_callback is not None:
         trainer.add_callback(log_callback)
     if wandb_callback is not None:
         trainer.add_callback(wandb_callback)
 
-    logger.info("Reordered callbacks: LossCorrectionCallback -> LogCallback -> WandbCallback")
+    logger.info("Reordered callbacks: LossCorrectionCallback -> ProgressCallback -> LogCallback -> WandbCallback")
 
     results = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model()

@@ -36,8 +36,8 @@ class LossCorrectionCallback(TrainerCallback):
     Callback to correct loss for DeepSpeed distributed training.
     DeepSpeed reports summed loss across GPUs, so we divide by world_size.
 
-    IMPORTANT: This callback must be added FIRST in the callbacks list
-    so it runs BEFORE WandbCallback logs the loss.
+    IMPORTANT: This callback must run BEFORE all other callbacks that use logs,
+    including ProgressCallback, WandbCallback, and LogCallback.
     """
 
     def on_log(
@@ -49,16 +49,15 @@ class LossCorrectionCallback(TrainerCallback):
         **kwargs
     ):
         # Correct loss for DeepSpeed distributed training
-        # This happens BEFORE WandbCallback and LogCallback see the data
+        # Modify both logs and state.log_history[-1] unconditionally
+        # Even if they're the same object, the second modification is a no-op
         if args.world_size > 1:
             if "loss" in logs:
-                logs["loss"] = logs["loss"] / args.world_size
-            # Also modify state.log_history[-1] if it's a DIFFERENT object
-            # (In some DeepSpeed configurations, they may not be the same)
-            if state.log_history and "loss" in state.log_history[-1]:
-                if logs is not state.log_history[-1]:
-                    # Different objects, need to modify both
-                    state.log_history[-1]["loss"] = state.log_history[-1]["loss"] / args.world_size
+                corrected_loss = logs["loss"] / args.world_size
+                logs["loss"] = corrected_loss
+                # Also update state.log_history[-1] for callbacks that read from there
+                if state.log_history and "loss" in state.log_history[-1]:
+                    state.log_history[-1]["loss"] = corrected_loss
 
 
 class LogCallback(TrainerCallback, ExportableState):
