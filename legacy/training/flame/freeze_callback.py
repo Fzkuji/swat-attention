@@ -463,11 +463,8 @@ class DynamicLazyLRCallback(TrainerCallback):
         optimizer.param_groups[self.lazy_param_group_idx]['lr'] = new_lazy_lr
 
         if self.verbose and _is_main_process() and abs(new_mult - self.current_mult) > 0.5:
-            # Display loss divided by world_size for readability
-            world_size = args.world_size if hasattr(args, 'world_size') and args.world_size > 1 else 1
-            display_loss = loss / world_size
             print(
-                f"\n[DynamicLazyLR] Step {state.global_step}: loss={display_loss:.2f} -> "
+                f"\n[DynamicLazyLR] Step {state.global_step}: loss={loss:.2f} -> "
                 f"lazy_mult={new_mult:.1f}x (lazy_lr = base_lr * loss * 10), "
                 f"lazy_lr={new_lazy_lr:.2e}",
                 flush=True

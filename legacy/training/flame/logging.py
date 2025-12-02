@@ -92,19 +92,16 @@ class LogCallback(TrainerCallback, ExportableState):
             state.log_history[-1]['throughput'] = logs['throughput'] = throughput
         state.stateful_callbacks["LogCallback"] = self.state()
 
-        # Correct loss for display (DeepSpeed reports summed loss)
+        # Print actual loss (DeepSpeed reports summed loss across GPUs)
         raw_loss = state.log_history[-1].get("loss", None)
         if raw_loss is not None and args.world_size > 1:
-            corrected_loss = raw_loss / args.world_size
-            # Also update state.log_history so other callbacks see corrected loss
-            state.log_history[-1]["loss"] = corrected_loss
-        else:
-            corrected_loss = raw_loss
+            actual_loss = raw_loss / args.world_size
+            print(f"[Actual Loss] {actual_loss:.4f} (displayed loss / {args.world_size})", flush=True)
 
-        output_logs = dict(
+        logs = dict(
             current_steps=state.global_step,
             total_steps=state.max_steps,
-            loss=corrected_loss,
+            loss=state.log_history[-1].get("loss", None),
             eval_loss=state.log_history[-1].get("eval_loss", None),
             predict_loss=state.log_history[-1].get("predict_loss", None),
             learning_rate=state.log_history[-1].get("learning_rate", None),
@@ -114,7 +111,7 @@ class LogCallback(TrainerCallback, ExportableState):
 
         os.makedirs(args.output_dir, exist_ok=True)
         with open(os.path.join(args.output_dir, "trainer_log.jsonl"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(output_logs) + "\n")
+            f.write(json.dumps(logs) + "\n")
 
     def state(self) -> dict:
         return {
