@@ -11,32 +11,6 @@ from transformers.trainer_callback import (ExportableState, TrainerCallback,
 from transformers.training_args import TrainingArguments
 
 
-class LossCorrectionCallback(TrainerCallback):
-    """
-    Callback to correct loss for DeepSpeed distributed training.
-    DeepSpeed reports summed loss across GPUs, so we divide by world_size.
-
-    IMPORTANT: This callback must be added FIRST in the callbacks list
-    so it runs BEFORE WandbCallback logs the loss.
-    """
-
-    def on_log(
-        self,
-        args: TrainingArguments,
-        state: TrainerState,
-        control: TrainerControl,
-        logs,
-        **kwargs
-    ):
-        # Correct loss in both logs dict and state.log_history
-        # This happens BEFORE WandbCallback sees the data
-        if args.world_size > 1:
-            if "loss" in logs:
-                logs["loss"] = logs["loss"] / args.world_size
-            if state.log_history and "loss" in state.log_history[-1]:
-                state.log_history[-1]["loss"] = state.log_history[-1]["loss"] / args.world_size
-
-
 def get_logger(name: str = None) -> logging.Logger:
     formatter = logging.Formatter(
         fmt="%(asctime)s - %(levelname)s - %(name)s - %(message)s", datefmt="%m/%d/%Y %H:%M:%S"
@@ -118,8 +92,23 @@ class LogCallback(TrainerCallback, ExportableState):
             state.log_history[-1]['throughput'] = logs['throughput'] = throughput
         state.stateful_callbacks["LogCallback"] = self.state()
 
-        # Loss is already corrected by LossCorrectionCallback (runs before WandbCallback)
-        actual_loss = state.log_history[-1].get("loss", None)
+        # Correct loss for DeepSpeed (reports summed loss across GPUs)
+        # WandbCallback runs BEFORE our callback, so we need to override wandb directly
+        raw_loss = state.log_history[-1].get("loss", None)
+        if raw_loss is not None and args.world_size > 1:
+            actual_loss = raw_loss / args.world_size
+            # Override wandb's incorrect loss with corrected value
+            try:
+                import wandb
+                if wandb.run is not None:
+                    # Use define_metric to ensure we can overwrite
+                    wandb.log({"loss": actual_loss}, step=state.global_step)
+            except ImportError:
+                pass
+            # Also update state.log_history for other uses
+            state.log_history[-1]["loss"] = actual_loss
+        else:
+            actual_loss = raw_loss
 
         logs = dict(
             current_steps=state.global_step,

@@ -7,7 +7,7 @@ import torch
 
 import fla  # noqa
 from flame.data import DataCollatorForLanguageModeling
-from flame.logging import LogCallback, LossCorrectionCallback, get_logger
+from flame.logging import LogCallback, get_logger
 from flame.parser import get_train_args
 from flame.freeze_callback import FreezeLazyParamsCallback, MonitorLazyParamsCallback, DynamicLazyLRCallback
 
@@ -106,8 +106,7 @@ def main():
         }
 
     # Callbacks
-    # LossCorrectionCallback MUST be first to correct loss before WandbCallback sees it
-    callbacks = [LossCorrectionCallback(), LogCallback()]
+    callbacks = [LogCallback()]
 
     # Monitor lazy attention parameters (bias, tau) to observe convergence
     monitor_lazy_steps = getattr(args, 'monitor_lazy_params_every', None)
