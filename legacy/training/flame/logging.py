@@ -38,6 +38,10 @@ class LossCorrectionCallback(TrainerCallback):
 
     IMPORTANT: This callback must be added FIRST in the callbacks list
     so it runs BEFORE WandbCallback logs the loss.
+
+    NOTE: Only modify logs["loss"], NOT state.log_history[-1]["loss"], because
+    in HuggingFace Trainer they are the SAME object (same reference).
+    Modifying both would cause double-division!
     """
 
     def on_log(
@@ -48,13 +52,11 @@ class LossCorrectionCallback(TrainerCallback):
         logs,
         **kwargs
     ):
-        # Correct loss in both logs dict and state.log_history
-        # This happens BEFORE WandbCallback sees the data
+        # Correct loss ONLY in logs dict (logs and state.log_history[-1] are same object)
+        # This happens BEFORE WandbCallback and LogCallback see the data
         if args.world_size > 1:
             if "loss" in logs:
                 logs["loss"] = logs["loss"] / args.world_size
-            if state.log_history and "loss" in state.log_history[-1]:
-                state.log_history[-1]["loss"] = state.log_history[-1]["loss"] / args.world_size
 
 
 class LogCallback(TrainerCallback, ExportableState):
@@ -118,13 +120,15 @@ class LogCallback(TrainerCallback, ExportableState):
             state.log_history[-1]['throughput'] = logs['throughput'] = throughput
         state.stateful_callbacks["LogCallback"] = self.state()
 
-        # Loss is already corrected by LossCorrectionCallback (runs before us)
-        actual_loss = state.log_history[-1].get("loss", None)
+        # Read loss from logs directly (not state.log_history) since LossCorrectionCallback
+        # modifies logs["loss"] and logs/state.log_history might be the same object,
+        # causing double-division if we modify both.
+        actual_loss = logs.get("loss", None)
 
         log_entry = dict(
             current_steps=state.global_step,
             total_steps=state.max_steps,
-            loss=actual_loss,  # Use corrected loss
+            loss=actual_loss,  # Use corrected loss from logs
             eval_loss=state.log_history[-1].get("eval_loss", None),
             predict_loss=state.log_history[-1].get("predict_loss", None),
             learning_rate=state.log_history[-1].get("learning_rate", None),
