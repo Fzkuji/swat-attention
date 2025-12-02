@@ -334,3 +334,114 @@ class TwoStageTrainingCallback(TrainerCallback):
                 f"[TwoStageTrainingCallback] Switched to Triton mode with frozen bias/tau",
                 flush=True
             )
+
+
+class DynamicLazyLRCallback(TrainerCallback):
+    """
+    Dynamically adjust learning rate for lazy params (bias/tau) based on loss.
+
+    When loss is high (e.g., 10), use higher LR multiplier for faster learning.
+    When loss is low (e.g., 3), use lower LR multiplier for stability.
+
+    Formula: lazy_lr_mult = max_mult * (loss / high_loss) ^ power
+
+    Example with default settings:
+        - loss=10: mult = 100 * (10/10)^1 = 100x
+        - loss=5:  mult = 100 * (5/10)^1  = 50x
+        - loss=3:  mult = 100 * (3/10)^1  = 30x
+        - loss=2:  mult = max(100 * (2/10)^1, 10) = 20x
+
+    Usage:
+        trainer = Trainer(
+            model=model,
+            callbacks=[DynamicLazyLRCallback(high_loss=10.0, max_mult=100.0)],
+            ...
+        )
+    """
+
+    def __init__(
+        self,
+        high_loss: float = 10.0,      # Loss value that corresponds to max_mult
+        max_mult: float = 100.0,       # Maximum LR multiplier when loss >= high_loss
+        min_mult: float = 10.0,        # Minimum LR multiplier (floor)
+        power: float = 1.0,            # Power for scaling (1.0 = linear)
+        update_every_n_steps: int = 10,  # How often to update
+        verbose: bool = True,
+    ):
+        self.high_loss = high_loss
+        self.max_mult = max_mult
+        self.min_mult = min_mult
+        self.power = power
+        self.update_every_n_steps = update_every_n_steps
+        self.verbose = verbose
+        self.current_mult = max_mult
+        self.lazy_param_group_idx = None  # Will be set on first call
+
+    def _find_lazy_param_group(self, optimizer):
+        """Find the parameter group index for lazy params."""
+        # LazyParamTrainer puts lazy params in the second group (index 1)
+        # with higher learning rate
+        if len(optimizer.param_groups) >= 2:
+            return 1  # Lazy params are in group 1
+        return None
+
+    def _compute_multiplier(self, loss: float) -> float:
+        """Compute LR multiplier based on current loss."""
+        if loss >= self.high_loss:
+            return self.max_mult
+
+        # Scale down based on loss ratio
+        ratio = loss / self.high_loss
+        mult = self.max_mult * (ratio ** self.power)
+
+        # Apply floor
+        return max(mult, self.min_mult)
+
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        logs=None,
+        model=None,
+        **kwargs
+    ):
+        """Update LR when loss is logged."""
+        if logs is None or 'loss' not in logs:
+            return
+
+        if state.global_step % self.update_every_n_steps != 0:
+            return
+
+        loss = logs['loss']
+        new_mult = self._compute_multiplier(loss)
+
+        # Get optimizer from trainer (passed in kwargs or state)
+        optimizer = kwargs.get('optimizer', None)
+        if optimizer is None:
+            return
+
+        # Find lazy param group on first call
+        if self.lazy_param_group_idx is None:
+            self.lazy_param_group_idx = self._find_lazy_param_group(optimizer)
+
+        if self.lazy_param_group_idx is None:
+            return
+
+        # Get base LR from first param group
+        base_lr = optimizer.param_groups[0]['lr']
+        new_lazy_lr = base_lr * new_mult
+
+        # Update lazy param group LR
+        old_lazy_lr = optimizer.param_groups[self.lazy_param_group_idx]['lr']
+        optimizer.param_groups[self.lazy_param_group_idx]['lr'] = new_lazy_lr
+
+        if self.verbose and _is_main_process() and abs(new_mult - self.current_mult) > 1:
+            print(
+                f"\n[DynamicLazyLR] Step {state.global_step}: loss={loss:.2f} -> "
+                f"lazy_mult={new_mult:.1f}x (was {self.current_mult:.1f}x), "
+                f"lazy_lr={new_lazy_lr:.2e}",
+                flush=True
+            )
+
+        self.current_mult = new_mult

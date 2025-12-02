@@ -43,7 +43,10 @@ echo "nodes:            ${nodes:=1}"
 echo "gpus:             ${gpus:=8}"
 echo "freeze_lazy:      ${freeze_lazy:=0}"
 echo "monitor_lazy:     ${monitor_lazy:=0}"
-echo "lazy_lr_mult:     ${lazy_lr_mult:=1.0}"
+echo "lazy_lr_mult:     ${lazy_lr_mult:=100.0}"
+echo "dynamic_lazy_lr:  ${dynamic_lazy_lr:=false}"
+echo "high_loss:        ${high_loss:=10.0}"
+echo "min_mult:         ${min_mult:=10.0}"
 
 params="--model_name_or_path $model \
     --tokenizer $tokenizer \
@@ -106,6 +109,9 @@ if [ $monitor_lazy -gt 0 ]; then
 fi
 # Always pass lazy_lr_multiplier (default 100x to overcome bf16 precision loss)
 params+=" --lazy_lr_multiplier $lazy_lr_mult"
+if [ "$dynamic_lazy_lr" == "true" ]; then
+  params+=" --dynamic_lazy_lr --dynamic_lazy_lr_high_loss $high_loss --dynamic_lazy_lr_min_mult $min_mult"
+fi
 
 echo "Launching training..."
 accelerate_params=""

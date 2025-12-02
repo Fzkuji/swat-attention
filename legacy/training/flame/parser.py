@@ -98,6 +98,27 @@ class TrainingArguments(TrainingArguments):
                     "Default: 100.0 (bias/tau use 100x the base learning rate)."
         },
     )
+    dynamic_lazy_lr: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable dynamic lazy LR based on loss. When enabled, lazy_lr_multiplier "
+                    "is scaled down as loss decreases (fast learning early, slow later)."
+        },
+    )
+    dynamic_lazy_lr_high_loss: float = field(
+        default=10.0,
+        metadata={
+            "help": "Loss value that corresponds to max multiplier in dynamic lazy LR. "
+                    "When loss >= this value, use full lazy_lr_multiplier."
+        },
+    )
+    dynamic_lazy_lr_min_mult: float = field(
+        default=10.0,
+        metadata={
+            "help": "Minimum LR multiplier floor for dynamic lazy LR. "
+                    "Even when loss is very low, multiplier won't go below this."
+        },
+    )
 
 
 def get_train_args():
