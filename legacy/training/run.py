@@ -149,26 +149,39 @@ def main():
         train_dataset=dataset
     )
 
-    # Reorder callbacks: LossCorrectionCallback must run BEFORE WandbCallback
+    # Reorder callbacks: LossCorrectionCallback must run BEFORE LogCallback and WandbCallback
     # HuggingFace Trainer adds default callbacks (including WandbCallback) before user callbacks
     # So we need to manually reorder them
     #
-    # Find our LossCorrectionCallback instance from the callbacks list
+    # Target order: ... -> LossCorrectionCallback -> LogCallback -> WandbCallback
     loss_correction_cb = None
+    log_callback = None
     wandb_callback = None
     for cb in trainer.callback_handler.callbacks:
         if isinstance(cb, LossCorrectionCallback):
             loss_correction_cb = cb
+        if isinstance(cb, LogCallback):
+            log_callback = cb
         if isinstance(cb, WandbCallback):
             wandb_callback = cb
 
-    if wandb_callback is not None and loss_correction_cb is not None:
-        # Remove both, then re-add in correct order: LossCorrectionCallback -> WandbCallback
+    # Remove all three and re-add in correct order
+    if loss_correction_cb is not None:
         trainer.remove_callback(LossCorrectionCallback)
+    if log_callback is not None:
+        trainer.remove_callback(LogCallback)
+    if wandb_callback is not None:
         trainer.remove_callback(WandbCallback)
+
+    # Re-add in order: LossCorrectionCallback -> LogCallback -> WandbCallback
+    if loss_correction_cb is not None:
         trainer.add_callback(loss_correction_cb)
+    if log_callback is not None:
+        trainer.add_callback(log_callback)
+    if wandb_callback is not None:
         trainer.add_callback(wandb_callback)
-        logger.info("Reordered callbacks: LossCorrectionCallback -> WandbCallback for correct loss logging")
+
+    logger.info("Reordered callbacks: LossCorrectionCallback -> LogCallback -> WandbCallback")
 
     results = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model()
