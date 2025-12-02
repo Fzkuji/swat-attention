@@ -96,17 +96,21 @@ class LogCallback(TrainerCallback, ExportableState):
         raw_loss = state.log_history[-1].get("loss", None)
         if raw_loss is not None and args.world_size > 1:
             actual_loss = raw_loss / args.world_size
-            # Update state.log_history so wandb/tensorboard get correct loss
-            state.log_history[-1]["loss"] = actual_loss
-            # Also update logs dict if it has loss
-            if "loss" in logs:
-                logs["loss"] = actual_loss
+            # Log corrected loss to wandb directly (WandbCallback runs before us)
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.log({"loss": actual_loss}, step=state.global_step)
+            except ImportError:
+                pass
             print(f"[Actual Loss] {actual_loss:.4f} (raw loss / {args.world_size})", flush=True)
+        else:
+            actual_loss = raw_loss
 
         logs = dict(
             current_steps=state.global_step,
             total_steps=state.max_steps,
-            loss=state.log_history[-1].get("loss", None),
+            loss=actual_loss,  # Use corrected loss
             eval_loss=state.log_history[-1].get("eval_loss", None),
             predict_loss=state.log_history[-1].get("predict_loss", None),
             learning_rate=state.log_history[-1].get("learning_rate", None),
