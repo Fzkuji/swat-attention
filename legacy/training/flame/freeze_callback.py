@@ -440,6 +440,9 @@ class DynamicLazyLRCallback(TrainerCallback):
             return
 
         loss = logs['loss']
+        # DeepSpeed ZeRO reports summed loss across GPUs, divide by world_size
+        world_size = args.world_size if hasattr(args, 'world_size') and args.world_size > 1 else 1
+        loss = loss / world_size
         new_mult = self._compute_multiplier(loss)
 
         # Get optimizer from trainer (passed in kwargs or state)
