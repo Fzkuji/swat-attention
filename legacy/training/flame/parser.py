@@ -102,15 +102,14 @@ class TrainingArguments(TrainingArguments):
         default=False,
         metadata={
             "help": "Enable dynamic lazy LR based on loss. "
-                    "Formula: lazy_lr = base_lr * scale * loss"
+                    "Formula: lazy_lr = base_lr * loss"
         },
     )
     dynamic_lazy_lr_scale: float = field(
-        default=10.0,
+        default=1.0,
         metadata={
-            "help": "Scale factor for dynamic lazy LR. "
-                    "Formula: lazy_lr = base_lr * scale * loss. "
-                    "Example: scale=10, loss=10 -> 100x base_lr."
+            "help": "[DEPRECATED - ignored] Scale factor for dynamic lazy LR. "
+                    "Now uses simple formula: lazy_lr = base_lr * loss."
         },
     )
     dynamic_lazy_lr_min_mult: float = field(
