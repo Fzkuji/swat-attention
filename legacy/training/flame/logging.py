@@ -115,10 +115,15 @@ class LogCallback(TrainerCallback, ExportableState):
             state.log_history[-1]['throughput'] = logs['throughput'] = throughput
         state.stateful_callbacks["LogCallback"] = self.state()
 
-        # Loss is already corrected by LossCorrectionCallback (runs before WandbCallback)
-        actual_loss = logs.get("loss", state.log_history[-1].get("loss", None))
+        # Get raw loss from state.log_history (which is NOT modified by LossCorrectionCallback)
+        # and compute corrected loss ourselves for the log file
+        raw_loss = state.log_history[-1].get("loss", None)
+        if raw_loss is not None and args.world_size > 1:
+            actual_loss = raw_loss / args.world_size
+        else:
+            actual_loss = raw_loss
 
-        logs = dict(
+        log_entry = dict(
             current_steps=state.global_step,
             total_steps=state.max_steps,
             loss=actual_loss,  # Use corrected loss
@@ -131,7 +136,7 @@ class LogCallback(TrainerCallback, ExportableState):
 
         os.makedirs(args.output_dir, exist_ok=True)
         with open(os.path.join(args.output_dir, "trainer_log.jsonl"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(logs) + "\n")
+            f.write(json.dumps(log_entry) + "\n")
 
     def state(self) -> dict:
         return {
