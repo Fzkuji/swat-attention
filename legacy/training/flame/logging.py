@@ -96,11 +96,15 @@ class LogCallback(TrainerCallback, ExportableState):
         raw_loss = state.log_history[-1].get("loss", None)
         if raw_loss is not None and args.world_size > 1:
             actual_loss = raw_loss / args.world_size
-            # Log corrected loss to wandb directly (WandbCallback runs before us)
+            # Log corrected loss to wandb with a different key to avoid conflict
+            # WandbCallback already logged "loss" before us, so we use "train/loss_actual"
             try:
                 import wandb
                 if wandb.run is not None:
-                    wandb.log({"loss": actual_loss}, step=state.global_step)
+                    wandb.log({
+                        "train/loss_actual": actual_loss,
+                        "train/loss_raw": raw_loss,
+                    }, step=state.global_step, commit=False)
             except ImportError:
                 pass
             print(f"[Actual Loss] {actual_loss:.4f} (raw loss / {args.world_size})", flush=True)
