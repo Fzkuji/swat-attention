@@ -11,6 +11,32 @@ from transformers.trainer_callback import (ExportableState, TrainerCallback,
 from transformers.training_args import TrainingArguments
 
 
+class LossCorrectionCallback(TrainerCallback):
+    """
+    Callback to correct loss for DeepSpeed distributed training.
+    DeepSpeed reports summed loss across GPUs, so we divide by world_size.
+
+    IMPORTANT: This callback must be added FIRST in the callbacks list
+    so it runs BEFORE WandbCallback logs the loss.
+    """
+
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        logs,
+        **kwargs
+    ):
+        # Correct loss in both logs dict and state.log_history
+        # This happens BEFORE WandbCallback sees the data
+        if args.world_size > 1:
+            if "loss" in logs:
+                logs["loss"] = logs["loss"] / args.world_size
+            if state.log_history and "loss" in state.log_history[-1]:
+                state.log_history[-1]["loss"] = state.log_history[-1]["loss"] / args.world_size
+
+
 def get_logger(name: str = None) -> logging.Logger:
     formatter = logging.Formatter(
         fmt="%(asctime)s - %(levelname)s - %(name)s - %(message)s", datefmt="%m/%d/%Y %H:%M:%S"
@@ -92,24 +118,8 @@ class LogCallback(TrainerCallback, ExportableState):
             state.log_history[-1]['throughput'] = logs['throughput'] = throughput
         state.stateful_callbacks["LogCallback"] = self.state()
 
-        # Correct loss for DeepSpeed (reports summed loss across GPUs)
-        raw_loss = state.log_history[-1].get("loss", None)
-        if raw_loss is not None and args.world_size > 1:
-            actual_loss = raw_loss / args.world_size
-            # Log corrected loss to wandb with a different key to avoid conflict
-            # WandbCallback already logged "loss" before us, so we use "train/loss_actual"
-            try:
-                import wandb
-                if wandb.run is not None:
-                    wandb.log({
-                        "train/loss_actual": actual_loss,
-                        "train/loss_raw": raw_loss,
-                    }, step=state.global_step, commit=False)
-            except ImportError:
-                pass
-            print(f"[Actual Loss] {actual_loss:.4f} (raw loss / {args.world_size})", flush=True)
-        else:
-            actual_loss = raw_loss
+        # Loss is already corrected by LossCorrectionCallback (runs before WandbCallback)
+        actual_loss = state.log_history[-1].get("loss", None)
 
         logs = dict(
             current_steps=state.global_step,
