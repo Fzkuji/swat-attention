@@ -3,6 +3,7 @@
 from datasets import load_from_disk
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
                           Trainer)
+from transformers.integrations import WandbCallback
 import torch
 
 import fla  # noqa
@@ -147,6 +148,27 @@ def main():
         callbacks=callbacks,
         train_dataset=dataset
     )
+
+    # Reorder callbacks: LossCorrectionCallback must run BEFORE WandbCallback
+    # HuggingFace Trainer adds default callbacks (including WandbCallback) before user callbacks
+    # So we need to manually reorder them
+    #
+    # Find our LossCorrectionCallback instance from the callbacks list
+    loss_correction_cb = None
+    wandb_callback = None
+    for cb in trainer.callback_handler.callbacks:
+        if isinstance(cb, LossCorrectionCallback):
+            loss_correction_cb = cb
+        if isinstance(cb, WandbCallback):
+            wandb_callback = cb
+
+    if wandb_callback is not None and loss_correction_cb is not None:
+        # Remove both, then re-add in correct order: LossCorrectionCallback -> WandbCallback
+        trainer.remove_callback(LossCorrectionCallback)
+        trainer.remove_callback(WandbCallback)
+        trainer.add_callback(loss_correction_cb)
+        trainer.add_callback(wandb_callback)
+        logger.info("Reordered callbacks: LossCorrectionCallback -> WandbCallback for correct loss logging")
 
     results = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model()
