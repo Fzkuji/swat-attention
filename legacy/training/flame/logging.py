@@ -38,10 +38,6 @@ class LossCorrectionCallback(TrainerCallback):
 
     IMPORTANT: This callback must be added FIRST in the callbacks list
     so it runs BEFORE WandbCallback logs the loss.
-
-    NOTE: Only modify logs["loss"], NOT state.log_history[-1]["loss"], because
-    in HuggingFace Trainer they are the SAME object (same reference).
-    Modifying both would cause double-division!
     """
 
     def on_log(
@@ -52,11 +48,17 @@ class LossCorrectionCallback(TrainerCallback):
         logs,
         **kwargs
     ):
-        # Correct loss ONLY in logs dict (logs and state.log_history[-1] are same object)
+        # Correct loss for DeepSpeed distributed training
         # This happens BEFORE WandbCallback and LogCallback see the data
         if args.world_size > 1:
             if "loss" in logs:
                 logs["loss"] = logs["loss"] / args.world_size
+            # Also modify state.log_history[-1] if it's a DIFFERENT object
+            # (In some DeepSpeed configurations, they may not be the same)
+            if state.log_history and "loss" in state.log_history[-1]:
+                if logs is not state.log_history[-1]:
+                    # Different objects, need to modify both
+                    state.log_history[-1]["loss"] = state.log_history[-1]["loss"] / args.world_size
 
 
 class LogCallback(TrainerCallback, ExportableState):
