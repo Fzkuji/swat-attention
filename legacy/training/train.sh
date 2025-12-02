@@ -43,7 +43,7 @@ echo "nodes:            ${nodes:=1}"
 echo "gpus:             ${gpus:=8}"
 echo "freeze_lazy:      ${freeze_lazy:=0}"
 echo "monitor_lazy:     ${monitor_lazy:=0}"
-echo "lazy_lr_mult:     ${lazy_lr_mult:=100.0}"
+echo "lazy_lr_mult:     ${lazy_lr_mult:=1.0}"
 
 params="--model_name_or_path $model \
     --tokenizer $tokenizer \
