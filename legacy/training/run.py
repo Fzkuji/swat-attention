@@ -3,7 +3,6 @@
 from datasets import load_from_disk
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
                           Trainer)
-from transformers.integrations import WandbCallback
 import torch
 
 import fla  # noqa
@@ -107,7 +106,8 @@ def main():
         }
 
     # Callbacks
-    callbacks = [LogCallback()]
+    # LossCorrectionCallback MUST be first to correct loss before WandbCallback sees it
+    callbacks = [LossCorrectionCallback(), LogCallback()]
 
     # Monitor lazy attention parameters (bias, tau) to observe convergence
     monitor_lazy_steps = getattr(args, 'monitor_lazy_params_every', None)
@@ -147,31 +147,6 @@ def main():
         callbacks=callbacks,
         train_dataset=dataset
     )
-
-    # Reorder callbacks: put LossCorrectionCallback BEFORE WandbCallback and LogCallback
-    # This ensures loss is corrected before both wandb and log file write it
-    # Order matters: LossCorrectionCallback -> LogCallback -> WandbCallback
-    wandb_callback = None
-    log_callback = None
-    for cb in trainer.callback_handler.callbacks:
-        if isinstance(cb, WandbCallback):
-            wandb_callback = cb
-        if isinstance(cb, LogCallback):
-            log_callback = cb
-
-    # Remove callbacks we want to reorder
-    if wandb_callback is not None:
-        trainer.remove_callback(WandbCallback)
-    if log_callback is not None:
-        trainer.remove_callback(LogCallback)
-
-    # Add back in correct order: LossCorrectionCallback first, then LogCallback, then WandbCallback
-    trainer.add_callback(LossCorrectionCallback())
-    if log_callback is not None:
-        trainer.add_callback(log_callback)
-    if wandb_callback is not None:
-        trainer.add_callback(wandb_callback)
-    logger.info("Reordered callbacks: LossCorrectionCallback -> LogCallback -> WandbCallback")
 
     results = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model()

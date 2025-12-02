@@ -33,11 +33,11 @@ LOG_FILE_NAME = "trainer_log.jsonl"
 
 class LossCorrectionCallback(TrainerCallback):
     """
-    Callback that corrects loss for DeepSpeed distributed training.
-
+    Callback to correct loss for DeepSpeed distributed training.
     DeepSpeed reports summed loss across GPUs, so we divide by world_size.
-    This callback MUST run before WandbCallback to ensure the corrected
-    loss is logged to wandb.
+
+    IMPORTANT: This callback must be added FIRST in the callbacks list
+    so it runs BEFORE WandbCallback logs the loss.
     """
 
     def on_log(
@@ -48,10 +48,13 @@ class LossCorrectionCallback(TrainerCallback):
         logs,
         **kwargs
     ):
-        # Only correct if multi-GPU and loss is present
-        if args.world_size > 1 and "loss" in logs:
-            logs["loss"] = logs["loss"] / args.world_size
-        return control
+        # Correct loss in both logs dict and state.log_history
+        # This happens BEFORE WandbCallback sees the data
+        if args.world_size > 1:
+            if "loss" in logs:
+                logs["loss"] = logs["loss"] / args.world_size
+            if state.log_history and "loss" in state.log_history[-1]:
+                state.log_history[-1]["loss"] = state.log_history[-1]["loss"] / args.world_size
 
 
 class LogCallback(TrainerCallback, ExportableState):
@@ -115,13 +118,8 @@ class LogCallback(TrainerCallback, ExportableState):
             state.log_history[-1]['throughput'] = logs['throughput'] = throughput
         state.stateful_callbacks["LogCallback"] = self.state()
 
-        # Get raw loss from state.log_history (which is NOT modified by LossCorrectionCallback)
-        # and compute corrected loss ourselves for the log file
-        raw_loss = state.log_history[-1].get("loss", None)
-        if raw_loss is not None and args.world_size > 1:
-            actual_loss = raw_loss / args.world_size
-        else:
-            actual_loss = raw_loss
+        # Loss is already corrected by LossCorrectionCallback (runs before us)
+        actual_loss = state.log_history[-1].get("loss", None)
 
         log_entry = dict(
             current_steps=state.global_step,
