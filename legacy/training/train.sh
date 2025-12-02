@@ -200,7 +200,7 @@ export HF_DATASETS_OFFLINE=1
 if [ "$date" == "" ]; then
   date=$(date +%Y%m%d%H%M)
 fi
-export WANDB_MODE=offline          # 添加这行
+# export WANDB_MODE=offline
 export WANDB_RESUME=allow
 export WANDB_NAME="$type.$(basename $path)"
 export WANDB_PROJECT=$project
