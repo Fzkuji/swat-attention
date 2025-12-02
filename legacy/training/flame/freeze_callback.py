@@ -99,6 +99,7 @@ class MonitorLazyParamsCallback(TrainerCallback):
             'bias_norm': [],
             'bias_grad_norm': [],
             'bias_change_rate': [],
+            'bias_stats': [],  # per-layer bias statistics (min, max, mean, std)
             'tau_norm': [],
             'tau_grad_norm': [],
             'tau_change_rate': [],
@@ -122,6 +123,26 @@ class MonitorLazyParamsCallback(TrainerCallback):
                         metrics['bias_change_rate'].append(delta / prev_norm)
 
                 self.prev_bias_params[name] = param.data.clone()
+
+                # Collect per-layer bias statistics
+                # bias shape: [num_heads, max_bias_length]
+                bias_data = param.data.cpu().float()
+                # Compute stats per head, then aggregate
+                head_means = bias_data.mean(dim=1)  # [num_heads]
+                head_stds = bias_data.std(dim=1)    # [num_heads]
+                # Also compute position-wise stats (how bias varies with distance)
+                pos_means = bias_data.mean(dim=0)   # [max_bias_length]
+                metrics['bias_stats'].append({
+                    'head_mean': head_means.tolist(),
+                    'head_std': head_stds.tolist(),
+                    'overall_min': bias_data.min().item(),
+                    'overall_max': bias_data.max().item(),
+                    'overall_mean': bias_data.mean().item(),
+                    'overall_std': bias_data.std().item(),
+                    # Sample positions: 0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512
+                    'pos_samples': [pos_means[min(i, len(pos_means)-1)].item()
+                                   for i in [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512]],
+                })
 
             # Check for tau parameter
             if hasattr(module, 'tau'):
@@ -158,6 +179,10 @@ class MonitorLazyParamsCallback(TrainerCallback):
             # Store all layers' tau values for full printout
             result['lazy/all_tau_values'] = metrics['tau_values']
 
+        # Store bias stats for all layers
+        if metrics['bias_stats']:
+            result['lazy/all_bias_stats'] = metrics['bias_stats']
+
         return result
 
     def _log_to_console(self, step, metrics):
@@ -190,6 +215,20 @@ class MonitorLazyParamsCallback(TrainerCallback):
                 tau_formatted = [f"{t:.2f}" for t in tau_list]
                 tau_min, tau_max, tau_mean = min(tau_list), max(tau_list), sum(tau_list)/len(tau_list)
                 print(f"    L{layer_idx:02d}: [{', '.join(tau_formatted)}] (min={tau_min:.2f}, max={tau_max:.2f}, mean={tau_mean:.2f})", flush=True)
+
+        # Print bias statistics per layer
+        all_bias_stats = metrics.get('lazy/all_bias_stats', [])
+        if all_bias_stats:
+            print(f"  Bias statistics per layer (positions 0,1,2,4,8,16,32,64,128,256,512):", flush=True)
+            for layer_idx, stats in enumerate(all_bias_stats):
+                pos_samples = stats['pos_samples']
+                pos_formatted = [f"{p:.3f}" for p in pos_samples]
+                print(
+                    f"    L{layer_idx:02d}: pos=[{', '.join(pos_formatted)}] "
+                    f"(min={stats['overall_min']:.3f}, max={stats['overall_max']:.3f}, "
+                    f"mean={stats['overall_mean']:.3f}, std={stats['overall_std']:.3f})",
+                    flush=True
+                )
 
         # Print convergence hint
         if bias_change < 0.001 and tau_change < 0.001 and step > 100:
