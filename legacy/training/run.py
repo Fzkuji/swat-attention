@@ -148,21 +148,30 @@ def main():
         train_dataset=dataset
     )
 
-    # Reorder callbacks: put LossCorrectionCallback BEFORE WandbCallback
-    # This ensures loss is corrected before wandb logs it
-    # HF Trainer adds default callbacks (including WandbCallback) before user callbacks,
-    # so we need to: 1) remove WandbCallback, 2) add LossCorrectionCallback, 3) re-add WandbCallback
+    # Reorder callbacks: put LossCorrectionCallback BEFORE WandbCallback and LogCallback
+    # This ensures loss is corrected before both wandb and log file write it
+    # Order matters: LossCorrectionCallback -> LogCallback -> WandbCallback
     wandb_callback = None
+    log_callback = None
     for cb in trainer.callback_handler.callbacks:
         if isinstance(cb, WandbCallback):
             wandb_callback = cb
-            break
+        if isinstance(cb, LogCallback):
+            log_callback = cb
 
+    # Remove callbacks we want to reorder
     if wandb_callback is not None:
         trainer.remove_callback(WandbCallback)
-        trainer.add_callback(LossCorrectionCallback())
+    if log_callback is not None:
+        trainer.remove_callback(LogCallback)
+
+    # Add back in correct order: LossCorrectionCallback first, then LogCallback, then WandbCallback
+    trainer.add_callback(LossCorrectionCallback())
+    if log_callback is not None:
+        trainer.add_callback(log_callback)
+    if wandb_callback is not None:
         trainer.add_callback(wandb_callback)
-        logger.info("Reordered callbacks: LossCorrectionCallback -> WandbCallback")
+    logger.info("Reordered callbacks: LossCorrectionCallback -> LogCallback -> WandbCallback")
 
     results = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model()
