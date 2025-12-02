@@ -3,11 +3,12 @@
 from datasets import load_from_disk
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
                           Trainer)
+from transformers.integrations import WandbCallback
 import torch
 
 import fla  # noqa
 from flame.data import DataCollatorForLanguageModeling
-from flame.logging import LogCallback, get_logger
+from flame.logging import LogCallback, LossCorrectionCallback, get_logger
 from flame.parser import get_train_args
 from flame.freeze_callback import FreezeLazyParamsCallback, MonitorLazyParamsCallback, DynamicLazyLRCallback
 
@@ -146,6 +147,22 @@ def main():
         callbacks=callbacks,
         train_dataset=dataset
     )
+
+    # Reorder callbacks: put LossCorrectionCallback BEFORE WandbCallback
+    # This ensures loss is corrected before wandb logs it
+    # HF Trainer adds default callbacks (including WandbCallback) before user callbacks,
+    # so we need to: 1) remove WandbCallback, 2) add LossCorrectionCallback, 3) re-add WandbCallback
+    wandb_callback = None
+    for cb in trainer.callback_handler.callbacks:
+        if isinstance(cb, WandbCallback):
+            wandb_callback = cb
+            break
+
+    if wandb_callback is not None:
+        trainer.remove_callback(WandbCallback)
+        trainer.add_callback(LossCorrectionCallback())
+        trainer.add_callback(wandb_callback)
+        logger.info("Reordered callbacks: LossCorrectionCallback -> WandbCallback")
 
     results = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model()

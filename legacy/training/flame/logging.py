@@ -31,6 +31,29 @@ logger = get_logger(__name__)
 LOG_FILE_NAME = "trainer_log.jsonl"
 
 
+class LossCorrectionCallback(TrainerCallback):
+    """
+    Callback that corrects loss for DeepSpeed distributed training.
+
+    DeepSpeed reports summed loss across GPUs, so we divide by world_size.
+    This callback MUST run before WandbCallback to ensure the corrected
+    loss is logged to wandb.
+    """
+
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        logs,
+        **kwargs
+    ):
+        # Only correct if multi-GPU and loss is present
+        if args.world_size > 1 and "loss" in logs:
+            logs["loss"] = logs["loss"] / args.world_size
+        return control
+
+
 class LogCallback(TrainerCallback, ExportableState):
     def __init__(self, start_time: float = None, elapsed_time: float = None):
 
@@ -92,24 +115,8 @@ class LogCallback(TrainerCallback, ExportableState):
             state.log_history[-1]['throughput'] = logs['throughput'] = throughput
         state.stateful_callbacks["LogCallback"] = self.state()
 
-        # Correct loss for DeepSpeed (reports summed loss across GPUs)
-        # WandbCallback runs BEFORE our callback, so we need to override wandb directly
-        raw_loss = state.log_history[-1].get("loss", None)
-        if raw_loss is not None and args.world_size > 1:
-            actual_loss = raw_loss / args.world_size
-            # Override wandb's incorrect loss with corrected value
-            # WandbCallback logs as "train/loss", so we override that
-            try:
-                import wandb
-                if wandb.run is not None:
-                    wandb.log({"train/loss": actual_loss}, step=state.global_step)
-            except ImportError:
-                pass
-            # Also update state.log_history for other uses
-            state.log_history[-1]["loss"] = actual_loss
-            logs["loss"] = actual_loss
-        else:
-            actual_loss = raw_loss
+        # Loss is already corrected by LossCorrectionCallback (runs before WandbCallback)
+        actual_loss = logs.get("loss", state.log_history[-1].get("loss", None))
 
         logs = dict(
             current_steps=state.global_step,
