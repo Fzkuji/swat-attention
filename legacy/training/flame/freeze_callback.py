@@ -379,13 +379,13 @@ class DynamicLazyLRCallback(TrainerCallback):
     """
     Dynamically adjust learning rate for lazy params (bias/tau) based on loss.
 
-    Formula: lazy_lr = base_lr * loss²
+    Formula: lazy_lr = base_lr * loss * 10
 
     Examples:
         - loss=10: lazy_lr = base_lr * 100 = 100x base_lr
-        - loss=5:  lazy_lr = base_lr * 25  = 25x base_lr
-        - loss=3:  lazy_lr = base_lr * 9   = 9x base_lr
-        - loss=1:  lazy_lr = base_lr * 1   = 1x base_lr
+        - loss=5:  lazy_lr = base_lr * 50  = 50x base_lr
+        - loss=3:  lazy_lr = base_lr * 30  = 30x base_lr
+        - loss=1:  lazy_lr = base_lr * 10  = 10x base_lr
 
     Usage:
         trainer = Trainer(
@@ -420,8 +420,8 @@ class DynamicLazyLRCallback(TrainerCallback):
         return None
 
     def _compute_multiplier(self, loss: float) -> float:
-        """Compute LR multiplier: use loss squared."""
-        return max(loss * loss, self.min_mult)
+        """Compute LR multiplier: loss * 10."""
+        return max(loss * 10, self.min_mult)
 
     def on_log(
         self,
@@ -465,7 +465,7 @@ class DynamicLazyLRCallback(TrainerCallback):
         if self.verbose and _is_main_process() and abs(new_mult - self.current_mult) > 0.5:
             print(
                 f"\n[DynamicLazyLR] Step {state.global_step}: loss={loss:.2f} -> "
-                f"lazy_mult={new_mult:.1f}x (lazy_lr = base_lr * loss²), "
+                f"lazy_mult={new_mult:.1f}x (lazy_lr = base_lr * loss * 10), "
                 f"lazy_lr={new_lazy_lr:.2e}",
                 flush=True
             )
