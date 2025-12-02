@@ -155,31 +155,41 @@ class MonitorLazyParamsCallback(TrainerCallback):
         # Store first layer's tau values for reference
         if metrics['tau_values']:
             result['lazy/tau_layer0'] = metrics['tau_values'][0]
+            # Store all layers' tau values for full printout
+            result['lazy/all_tau_values'] = metrics['tau_values']
 
         return result
 
     def _log_to_console(self, step, metrics):
-        """Print metrics to console."""
+        """Print metrics to console with full tau values for all layers."""
         bias_norm = metrics.get('lazy/bias_norm_mean', 0)
         bias_grad = metrics.get('lazy/bias_grad_norm_mean', 0)
         bias_change = metrics.get('lazy/bias_change_rate_mean', 0)
         tau_norm = metrics.get('lazy/tau_norm_mean', 0)
         tau_grad = metrics.get('lazy/tau_grad_norm_mean', 0)
         tau_change = metrics.get('lazy/tau_change_rate_mean', 0)
-        num_layers = len(metrics.get('lazy/bias_norm_mean', [])) if isinstance(metrics.get('lazy/bias_norm_mean'), list) else 0
 
-        # Get first layer's tau values for debugging
+        # Get first layer's tau values for summary line
         tau_values = metrics.get('lazy/tau_layer0', [])
-        tau_str = str(tau_values[:4]) if tau_values else "N/A"  # Show first 4 heads
+        tau_str = str([round(t, 2) for t in tau_values[:4]]) if tau_values else "N/A"
 
-        # Use print for reliable output (logger.info may be filtered)
+        # Summary line
         print(
-            f"\n[Step {step}] Lazy params (found {len(self.prev_bias_params)} layers): "
+            f"\n[Step {step}] Lazy params ({len(self.prev_bias_params)} layers): "
             f"bias(norm={bias_norm:.4f}, grad={bias_grad:.6f}, change={bias_change:.6f}) "
             f"tau(norm={tau_norm:.4f}, grad={tau_grad:.6f}, change={tau_change:.6f}) "
-            f"tau_vals={tau_str}",
+            f"layer0_tau={tau_str}",
             flush=True
         )
+
+        # Print full tau values for all layers
+        all_tau_values = metrics.get('lazy/all_tau_values', [])
+        if all_tau_values:
+            print(f"  Full tau values per layer:", flush=True)
+            for layer_idx, tau_list in enumerate(all_tau_values):
+                tau_formatted = [f"{t:.2f}" for t in tau_list]
+                tau_min, tau_max, tau_mean = min(tau_list), max(tau_list), sum(tau_list)/len(tau_list)
+                print(f"    L{layer_idx:02d}: [{', '.join(tau_formatted)}] (min={tau_min:.2f}, max={tau_max:.2f}, mean={tau_mean:.2f})", flush=True)
 
         # Print convergence hint
         if bias_change < 0.001 and tau_change < 0.001 and step > 100:
