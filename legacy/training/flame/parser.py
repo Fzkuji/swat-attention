@@ -101,19 +101,20 @@ class TrainingArguments(TrainingArguments):
     dynamic_lazy_lr: bool = field(
         default=False,
         metadata={
-            "help": "Enable dynamic lazy LR based on loss. When enabled, lazy_lr_multiplier "
-                    "is scaled down as loss decreases (fast learning early, slow later)."
+            "help": "Enable dynamic lazy LR based on loss. "
+                    "Formula: lazy_lr = base_lr * scale * loss"
         },
     )
-    dynamic_lazy_lr_high_loss: float = field(
+    dynamic_lazy_lr_scale: float = field(
         default=10.0,
         metadata={
-            "help": "Loss value that corresponds to max multiplier in dynamic lazy LR. "
-                    "When loss >= this value, use full lazy_lr_multiplier."
+            "help": "Scale factor for dynamic lazy LR. "
+                    "Formula: lazy_lr = base_lr * scale * loss. "
+                    "Example: scale=10, loss=10 -> 100x base_lr."
         },
     )
     dynamic_lazy_lr_min_mult: float = field(
-        default=10.0,
+        default=1.0,
         metadata={
             "help": "Minimum LR multiplier floor for dynamic lazy LR. "
                     "Even when loss is very low, multiplier won't go below this."

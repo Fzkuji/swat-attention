@@ -124,17 +124,15 @@ def main():
         logger.info(f"Will freeze bias/tau parameters after {freeze_after_steps} steps")
         callbacks.append(FreezeLazyParamsCallback(freeze_after_steps=freeze_after_steps))
 
-    # Dynamic lazy LR: scale down multiplier as loss decreases
-    # This provides fast learning early (high loss) and stability later (low loss)
+    # Dynamic lazy LR: directly multiply loss by scale factor
+    # lazy_lr = base_lr * scale * loss
     dynamic_lazy_lr = getattr(args, 'dynamic_lazy_lr', False)
     if dynamic_lazy_lr:
-        high_loss = getattr(args, 'dynamic_lazy_lr_high_loss', 10.0)
-        min_mult = getattr(args, 'dynamic_lazy_lr_min_mult', 10.0)
-        max_mult = getattr(args, 'lazy_lr_multiplier', 100.0)
-        logger.info(f"Dynamic lazy LR enabled: max_mult={max_mult}x at loss>={high_loss}, min_mult={min_mult}x")
+        scale = getattr(args, 'dynamic_lazy_lr_scale', 10.0)
+        min_mult = getattr(args, 'dynamic_lazy_lr_min_mult', 1.0)
+        logger.info(f"Dynamic lazy LR enabled: lazy_lr = base_lr * {scale} * loss (min_mult={min_mult}x)")
         callbacks.append(DynamicLazyLRCallback(
-            high_loss=high_loss,
-            max_mult=max_mult,
+            scale=scale,
             min_mult=min_mult,
         ))
 

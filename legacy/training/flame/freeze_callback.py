@@ -340,41 +340,37 @@ class DynamicLazyLRCallback(TrainerCallback):
     """
     Dynamically adjust learning rate for lazy params (bias/tau) based on loss.
 
-    When loss is high (e.g., 10), use higher LR multiplier for faster learning.
-    When loss is low (e.g., 3), use lower LR multiplier for stability.
+    Simple formula: lazy_lr = base_lr * scale * loss
 
-    Formula: lazy_lr_mult = max_mult * (loss / high_loss) ^ power
-
-    Example with default settings:
-        - loss=10: mult = 100 * (10/10)^1 = 100x
-        - loss=5:  mult = 100 * (5/10)^1  = 50x
-        - loss=3:  mult = 100 * (3/10)^1  = 30x
-        - loss=2:  mult = max(100 * (2/10)^1, 10) = 20x
+    Example with scale=10:
+        - loss=10: lazy_lr = base_lr * 10 * 10 = 100x base_lr
+        - loss=5:  lazy_lr = base_lr * 10 * 5  = 50x base_lr
+        - loss=3:  lazy_lr = base_lr * 10 * 3  = 30x base_lr
+        - loss=1:  lazy_lr = base_lr * 10 * 1  = 10x base_lr
 
     Usage:
         trainer = Trainer(
             model=model,
-            callbacks=[DynamicLazyLRCallback(high_loss=10.0, max_mult=100.0)],
+            callbacks=[DynamicLazyLRCallback(scale=10.0)],
             ...
         )
     """
 
     def __init__(
         self,
-        high_loss: float = 10.0,      # Loss value that corresponds to max_mult
-        max_mult: float = 100.0,       # Maximum LR multiplier when loss >= high_loss
-        min_mult: float = 10.0,        # Minimum LR multiplier (floor)
-        power: float = 1.0,            # Power for scaling (1.0 = linear)
+        scale: float = 10.0,           # Scale factor: lazy_lr = base_lr * scale * loss
+        min_mult: float = 1.0,         # Minimum LR multiplier (floor)
         update_every_n_steps: int = 10,  # How often to update
         verbose: bool = True,
+        # Legacy params for compatibility (ignored)
+        high_loss: float = None,
+        max_mult: float = None,
     ):
-        self.high_loss = high_loss
-        self.max_mult = max_mult
+        self.scale = scale
         self.min_mult = min_mult
-        self.power = power
         self.update_every_n_steps = update_every_n_steps
         self.verbose = verbose
-        self.current_mult = max_mult
+        self.current_mult = scale * 10  # Initial estimate
         self.lazy_param_group_idx = None  # Will be set on first call
 
     def _find_lazy_param_group(self, optimizer):
@@ -386,15 +382,8 @@ class DynamicLazyLRCallback(TrainerCallback):
         return None
 
     def _compute_multiplier(self, loss: float) -> float:
-        """Compute LR multiplier based on current loss."""
-        if loss >= self.high_loss:
-            return self.max_mult
-
-        # Scale down based on loss ratio
-        ratio = loss / self.high_loss
-        mult = self.max_mult * (ratio ** self.power)
-
-        # Apply floor
+        """Compute LR multiplier: directly multiply loss by scale."""
+        mult = self.scale * loss
         return max(mult, self.min_mult)
 
     def on_log(
