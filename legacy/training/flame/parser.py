@@ -102,7 +102,7 @@ class TrainingArguments(TrainingArguments):
         default=False,
         metadata={
             "help": "Enable dynamic lazy LR based on loss. "
-                    "Formula: lazy_lr = base_lr * loss"
+                    "Formula: lazy_lr = base_lr * loss²"
         },
     )
     dynamic_lazy_lr_scale: float = field(
