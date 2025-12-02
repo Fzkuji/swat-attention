@@ -92,11 +92,16 @@ class LogCallback(TrainerCallback, ExportableState):
             state.log_history[-1]['throughput'] = logs['throughput'] = throughput
         state.stateful_callbacks["LogCallback"] = self.state()
 
-        # Print actual loss (DeepSpeed reports summed loss across GPUs)
+        # Correct loss for DeepSpeed (reports summed loss across GPUs)
         raw_loss = state.log_history[-1].get("loss", None)
         if raw_loss is not None and args.world_size > 1:
             actual_loss = raw_loss / args.world_size
-            print(f"[Actual Loss] {actual_loss:.4f} (displayed loss / {args.world_size})", flush=True)
+            # Update state.log_history so wandb/tensorboard get correct loss
+            state.log_history[-1]["loss"] = actual_loss
+            # Also update logs dict if it has loss
+            if "loss" in logs:
+                logs["loss"] = actual_loss
+            print(f"[Actual Loss] {actual_loss:.4f} (raw loss / {args.world_size})", flush=True)
 
         logs = dict(
             current_steps=state.global_step,
