@@ -91,11 +91,11 @@ class TrainingArguments(TrainingArguments):
         },
     )
     lazy_lr_multiplier: float = field(
-        default=100.0,
+        default=10.0,
         metadata={
             "help": "Learning rate multiplier for bias/tau parameters in SWAT attention. "
                     "Higher values help overcome bf16 precision loss in optimizer updates. "
-                    "Default: 100.0 (bias/tau use 100x the base learning rate)."
+                    "Default: 10.0 (bias/tau use 10x the base learning rate)."
         },
     )
     dynamic_lazy_lr: bool = field(
