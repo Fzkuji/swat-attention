@@ -5,7 +5,6 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
                           Trainer)
 from transformers.integrations import WandbCallback
 from transformers.trainer_callback import ProgressCallback
-import torch
 
 import fla  # noqa
 from flame.data import DataCollatorForLanguageModeling
@@ -14,54 +13,6 @@ from flame.parser import get_train_args
 from flame.freeze_callback import FreezeLazyParamsCallback, MonitorLazyParamsCallback, DynamicLazyLRCallback
 
 logger = get_logger(__name__)
-
-
-class LazyParamTrainer(Trainer):
-    """
-    Custom Trainer that uses higher learning rate for bias/tau parameters.
-    This helps overcome bf16 precision loss in optimizer updates.
-    """
-
-    def __init__(self, lazy_lr_multiplier=100.0, **kwargs):
-        self.lazy_lr_multiplier = lazy_lr_multiplier
-        super().__init__(**kwargs)
-
-    def create_optimizer(self):
-        """Create optimizer with parameter-specific learning rates."""
-        if self.optimizer is not None:
-            return self.optimizer
-
-        # Separate parameters into lazy params and others
-        lazy_params = []
-        other_params = []
-
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if 'learnable_bias_diagonals' in name or '.tau' in name:
-                lazy_params.append(param)
-                logger.info(f"Lazy param (higher lr): {name}")
-            else:
-                other_params.append(param)
-
-        base_lr = self.args.learning_rate
-        lazy_lr = base_lr * self.lazy_lr_multiplier
-
-        logger.info(f"Base LR: {base_lr}, Lazy params LR: {lazy_lr} ({self.lazy_lr_multiplier}x)")
-
-        optimizer_grouped_parameters = [
-            {"params": other_params, "lr": base_lr},
-            {"params": lazy_params, "lr": lazy_lr},
-        ]
-
-        # Use the same optimizer class as default
-        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args, self.model)
-
-        # Remove lr from kwargs since we set it per group
-        optimizer_kwargs.pop("lr", None)
-
-        self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
-        return self.optimizer
 
 
 def main():
@@ -137,11 +88,7 @@ def main():
             min_mult=min_mult,
         ))
 
-    # Get lazy_lr_multiplier from args, default 100x to overcome bf16 precision loss
-    lazy_lr_multiplier = getattr(args, 'lazy_lr_multiplier', 100.0)
-
-    trainer = LazyParamTrainer(
-        lazy_lr_multiplier=lazy_lr_multiplier,
+    trainer = Trainer(
         model=model,
         args=args,
         processing_class=tokenizer,

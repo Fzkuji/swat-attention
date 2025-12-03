@@ -93,9 +93,8 @@ class TrainingArguments(TrainingArguments):
     lazy_lr_multiplier: float = field(
         default=1.0,
         metadata={
-            "help": "Learning rate multiplier for bias/tau parameters in SWAT attention. "
-                    "Default: 1.0 (same as base learning rate). "
-                    "TAU_SCALE and dynamic_lazy_lr provide gradient amplification."
+            "help": "[DEPRECATED - ignored] Learning rate multiplier for bias/tau parameters. "
+                    "No longer used. TAU_SCALE=1000 provides gradient amplification."
         },
     )
     dynamic_lazy_lr: bool = field(
