@@ -43,6 +43,7 @@ echo "nodes:            ${nodes:=1}"
 echo "gpus:             ${gpus:=8}"
 echo "freeze_lazy:      ${freeze_lazy:=0}"
 echo "monitor_lazy:     ${monitor_lazy:=0}"
+echo "lazy_lr_mult:     ${lazy_lr_mult:=10.0}"
 echo "dynamic_lazy_lr:  ${dynamic_lazy_lr:=false}"
 echo "min_mult:         ${min_mult:=1.0}"
 
@@ -108,6 +109,9 @@ fi
 if [ "$dynamic_lazy_lr" == "true" ]; then
   params+=" --dynamic_lazy_lr --dynamic_lazy_lr_min_mult $min_mult"
 fi
+
+# Always pass lazy_lr_multiplier (default 10x)
+params+=" --lazy_lr_multiplier $lazy_lr_mult"
 
 echo "Launching training..."
 accelerate_params=""

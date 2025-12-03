@@ -91,10 +91,11 @@ class TrainingArguments(TrainingArguments):
         },
     )
     lazy_lr_multiplier: float = field(
-        default=1.0,
+        default=10.0,
         metadata={
-            "help": "[DEPRECATED - ignored] Learning rate multiplier for bias/tau parameters. "
-                    "No longer used. TAU_SCALE=100 provides gradient amplification."
+            "help": "Learning rate multiplier for bias/tau parameters. "
+                    "Default 10x means lazy params use 10x higher max LR than other params. "
+                    "Combined with TAU_SCALE=100 for gradient amplification in bf16."
         },
     )
     dynamic_lazy_lr: bool = field(
