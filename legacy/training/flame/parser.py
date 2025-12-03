@@ -94,7 +94,7 @@ class TrainingArguments(TrainingArguments):
         default=1.0,
         metadata={
             "help": "[DEPRECATED - ignored] Learning rate multiplier for bias/tau parameters. "
-                    "No longer used. TAU_SCALE=1000 provides gradient amplification."
+                    "No longer used. TAU_SCALE=100 provides gradient amplification."
         },
     )
     dynamic_lazy_lr: bool = field(
