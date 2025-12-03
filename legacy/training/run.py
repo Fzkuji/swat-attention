@@ -10,7 +10,7 @@ import fla  # noqa
 from flame.data import DataCollatorForLanguageModeling
 from flame.logging import LogCallback, LossCorrectionCallback, get_logger
 from flame.parser import get_train_args
-from flame.freeze_callback import FreezeLazyParamsCallback, MonitorLazyParamsCallback, DynamicLazyLRCallback
+from flame.freeze_callback import FreezeLazyParamsCallback, MonitorLazyParamsCallback, DynamicLazyLRCallback, FastCosineSchedulerCallback
 
 logger = get_logger(__name__)
 
@@ -160,6 +160,17 @@ def main():
     # Get lazy_lr_multiplier from args (default 10x)
     lazy_lr_multiplier = getattr(args, 'lazy_lr_multiplier', 10.0)
     logger.info(f"Using LazyParamTrainer with lazy_lr_multiplier={lazy_lr_multiplier}x")
+
+    # Fast cosine schedule for lazy params: 10x faster decay
+    # This applies a compressed cosine schedule that completes in 1/10 of total steps
+    # The FastCosineSchedulerCallback overrides the LR set by LazyParamTrainer each step
+    speed_factor = 10.0  # Same as lazy_lr_multiplier by default
+    logger.info(f"Adding FastCosineSchedulerCallback: lazy params use {speed_factor}x faster cosine schedule")
+    callbacks.append(FastCosineSchedulerCallback(
+        speed_factor=speed_factor,
+        lr_multiplier=lazy_lr_multiplier,
+        min_lr_ratio=0.1,  # min_lr = max_lr * 0.1
+    ))
 
     trainer = LazyParamTrainer(
         lazy_lr_multiplier=lazy_lr_multiplier,

@@ -471,3 +471,123 @@ class DynamicLazyLRCallback(TrainerCallback):
             )
 
         self.current_mult = new_mult
+
+
+class FastCosineSchedulerCallback(TrainerCallback):
+    """
+    Apply a faster cosine LR schedule to lazy params (bias/tau).
+
+    While base params follow the normal cosine schedule over max_steps,
+    lazy params follow a compressed cosine schedule that completes in
+    (max_steps / speed_factor) steps.
+
+    Example with speed_factor=10:
+        - Base params: warmup 512 steps, cosine decay over 10000 steps
+        - Lazy params: warmup 51 steps, cosine decay over 1000 steps, then min_lr
+
+    This allows lazy params to:
+    1. Learn quickly at the beginning (10x higher peak LR)
+    2. Stabilize faster (cosine completes in 1/10 of training)
+    3. Be frozen once their schedule completes
+    """
+
+    def __init__(
+        self,
+        speed_factor: float = 10.0,  # How much faster lazy params train
+        lr_multiplier: float = 10.0,  # Peak LR multiplier for lazy params
+        min_lr_ratio: float = 0.1,    # min_lr = max_lr * min_lr_ratio
+        verbose: bool = True,
+    ):
+        self.speed_factor = speed_factor
+        self.lr_multiplier = lr_multiplier
+        self.min_lr_ratio = min_lr_ratio
+        self.verbose = verbose
+        self.lazy_param_group_idx = None
+        self.initialized = False
+        self.last_logged_step = -100
+
+    def _find_lazy_param_group(self, optimizer):
+        """Find the parameter group index for lazy params."""
+        if len(optimizer.param_groups) >= 2:
+            return 1  # Lazy params are in group 1
+        return None
+
+    def _cosine_schedule(self, step, warmup_steps, total_steps, max_lr, min_lr):
+        """Compute LR using cosine schedule with warmup."""
+        import math
+
+        if step < warmup_steps:
+            # Linear warmup
+            return max_lr * step / max(warmup_steps, 1)
+        elif step >= total_steps:
+            # After schedule completes, stay at min_lr
+            return min_lr
+        else:
+            # Cosine decay
+            progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+            return min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    def on_step_begin(
+        self,
+        args,
+        state,
+        control,
+        **kwargs
+    ):
+        """Update lazy LR at each step according to faster cosine schedule."""
+        optimizer = kwargs.get('optimizer', None)
+        if optimizer is None:
+            return
+
+        # Find lazy param group on first call
+        if self.lazy_param_group_idx is None:
+            self.lazy_param_group_idx = self._find_lazy_param_group(optimizer)
+
+        if self.lazy_param_group_idx is None:
+            return
+
+        # Compute lazy schedule parameters (compressed by speed_factor)
+        base_lr = args.learning_rate
+        lazy_max_lr = base_lr * self.lr_multiplier
+        lazy_min_lr = lazy_max_lr * self.min_lr_ratio
+
+        lazy_warmup_steps = int(args.warmup_steps / self.speed_factor)
+        lazy_total_steps = int(args.max_steps / self.speed_factor)
+
+        # Compute lazy LR using faster cosine schedule
+        lazy_lr = self._cosine_schedule(
+            state.global_step,
+            lazy_warmup_steps,
+            lazy_total_steps,
+            lazy_max_lr,
+            lazy_min_lr
+        )
+
+        # Update lazy param group LR
+        optimizer.param_groups[self.lazy_param_group_idx]['lr'] = lazy_lr
+
+        # Log occasionally
+        if self.verbose and _is_main_process():
+            if not self.initialized:
+                print(
+                    f"\n[FastCosineScheduler] Lazy params schedule:"
+                    f"\n  - Peak LR: {lazy_max_lr:.2e} ({self.lr_multiplier}x base)"
+                    f"\n  - Min LR: {lazy_min_lr:.2e}"
+                    f"\n  - Warmup: {lazy_warmup_steps} steps (vs {args.warmup_steps} for base)"
+                    f"\n  - Total: {lazy_total_steps} steps (vs {args.max_steps} for base)"
+                    f"\n  - Speed factor: {self.speed_factor}x faster",
+                    flush=True
+                )
+                self.initialized = True
+
+            # Log at key milestones
+            if (state.global_step in [1, lazy_warmup_steps, lazy_total_steps] or
+                state.global_step - self.last_logged_step >= 500):
+                base_lr_current = optimizer.param_groups[0]['lr']
+                print(
+                    f"\n[FastCosineScheduler] Step {state.global_step}: "
+                    f"base_lr={base_lr_current:.2e}, lazy_lr={lazy_lr:.2e} "
+                    f"({lazy_lr/base_lr_current:.1f}x)",
+                    flush=True
+                )
+                self.last_logged_step = state.global_step
