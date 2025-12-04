@@ -87,32 +87,20 @@ class SWAttention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim)
             self.k_norm = RMSNorm(self.head_dim)
 
-        # Lazy Attention 的可学习参数（与scratch分支保持一致）
-        #
-        # IMPORTANT: We use scaled-down representations to AMPLIFY gradients.
-        # Store param_small = param / SCALE, then multiply by SCALE in forward pass.
-        # This amplifies gradients by SCALE (chain rule) while maintaining the same math.
-        #
-        # Math: actual_param = param_small * SCALE
-        # Gradient: d(loss)/d(param_small) = d(loss)/d(actual_param) * SCALE
-        #
-        # With SCALE=100, gradients are 100x larger, helping with bf16 precision.
+        # Lazy Attention 的可学习参数
+        # Parameters store actual values directly for inference compatibility.
+        # Use separate param groups with longer warmup via FastCosineSchedulerCallback.
 
         # 位置 bias: [num_heads, max_bias_length]
         # 距离范围 [0, max_bias_length)
-        # bias_init = 0, stored as 0/100 = 0
-        self.BIAS_SCALE = 100.0  # Gradient amplification factor for bias
         self.learnable_bias_diagonals = nn.Parameter(
             torch.zeros(self.num_heads, self.max_bias_length)
         )
-        # std=1e-3 for actual bias -> std=1e-5 for stored bias_small
-        nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=1e-3 / self.BIAS_SCALE)
+        nn.init.normal_(self.learnable_bias_diagonals, mean=0.0, std=1e-3)
 
         # Elastic-Softmax 的 τ 参数: [num_heads]
         # τ_init = -1，对应论文公式 ReLU(Softmax + τ/i)
-        # tau=-1 is stored as tau_small=-0.01
-        self.TAU_SCALE = 100.0  # Gradient amplification factor for tau
-        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0 / self.TAU_SCALE))
+        self.tau = nn.Parameter(torch.full((self.num_heads,), -1.0))
 
         self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
 
@@ -169,17 +157,10 @@ class SWAttention(nn.Module):
         # Call Lazy Attention Triton kernel
         # Triton kernel 内部已经实现了 causal mask，不需要传入 varlen
         # window_size 从 bias.shape[1] 自动推断
-        #
-        # IMPORTANT: Multiply param_small by SCALE to get actual values.
-        # This amplifies gradients by SCALE (chain rule):
-        #   d(loss)/d(param_small) = d(loss)/d(actual_param) * SCALE
-        # With 100x gradient amplification, updates are visible in bf16!
-        actual_bias = self.learnable_bias_diagonals * self.BIAS_SCALE
-        actual_tau = self.tau * self.TAU_SCALE
         attn_output = lazy_attention_triton(
             q, k, v,
-            bias=actual_bias.to(q.dtype),
-            tau=actual_tau.to(q.dtype),
+            bias=self.learnable_bias_diagonals.to(q.dtype),
+            tau=self.tau.to(q.dtype),
         )
 
         # Convert back: [B, H, L, D] -> [B, L, H*D]

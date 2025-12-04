@@ -148,10 +148,8 @@ class MonitorLazyParamsCallback(TrainerCallback):
             if hasattr(module, 'tau'):
                 param = module.tau
                 metrics['tau_norm'].append(param.data.norm().item())
-                # Get actual tau values (multiply by TAU_SCALE if using scaled-down representation)
-                # tau_small * TAU_SCALE = actual_tau
-                tau_scale = getattr(module, 'TAU_SCALE', 1.0)
-                actual_tau = param.data.cpu() * tau_scale
+                # tau stores actual values directly
+                actual_tau = param.data.cpu()
                 metrics['tau_values'].append(actual_tau.tolist())
 
                 if param.grad is not None:
@@ -481,26 +479,28 @@ class FastCosineSchedulerCallback(TrainerCallback):
     lazy params follow a compressed cosine schedule that completes in
     (max_steps / speed_factor) steps.
 
-    Example with speed_factor=10:
+    Example with speed_factor=10, warmup_multiplier=2:
         - Base params: warmup 512 steps, cosine decay over 10000 steps
-        - Lazy params: warmup 51 steps, cosine decay over 1000 steps, then min_lr
+        - Lazy params: warmup 1024 steps (2x longer!), cosine decay over 1000 steps
 
     This allows lazy params to:
-    1. Learn quickly at the beginning (10x higher peak LR)
+    1. Learn more slowly at the beginning (longer warmup)
     2. Stabilize faster (cosine completes in 1/10 of training)
     3. Be frozen once their schedule completes
     """
 
     def __init__(
         self,
-        speed_factor: float = 10.0,  # How much faster lazy params train
+        speed_factor: float = 10.0,  # How much faster lazy params train (total steps)
         lr_multiplier: float = 10.0,  # Peak LR multiplier for lazy params
         min_lr_ratio: float = 0.1,    # min_lr = max_lr * min_lr_ratio
+        warmup_multiplier: float = 2.0,  # Lazy warmup = base warmup * this
         verbose: bool = True,
     ):
         self.speed_factor = speed_factor
         self.lr_multiplier = lr_multiplier
         self.min_lr_ratio = min_lr_ratio
+        self.warmup_multiplier = warmup_multiplier
         self.verbose = verbose
         self.lazy_param_group_idx = None
         self.initialized = False
@@ -546,12 +546,14 @@ class FastCosineSchedulerCallback(TrainerCallback):
         if self.lazy_param_group_idx is None:
             return
 
-        # Compute lazy schedule parameters (compressed by speed_factor)
+        # Compute lazy schedule parameters
+        # - warmup: 2x longer than base (slower start)
+        # - total: compressed by speed_factor (faster finish)
         base_lr = args.learning_rate
         lazy_max_lr = base_lr * self.lr_multiplier
         lazy_min_lr = lazy_max_lr * self.min_lr_ratio
 
-        lazy_warmup_steps = int(args.warmup_steps / self.speed_factor)
+        lazy_warmup_steps = int(args.warmup_steps * self.warmup_multiplier)
         lazy_total_steps = int(args.max_steps / self.speed_factor)
 
         # Compute lazy LR using faster cosine schedule
@@ -573,9 +575,8 @@ class FastCosineSchedulerCallback(TrainerCallback):
                     f"\n[FastCosineScheduler] Lazy params schedule:"
                     f"\n  - Peak LR: {lazy_max_lr:.2e} ({self.lr_multiplier}x base)"
                     f"\n  - Min LR: {lazy_min_lr:.2e}"
-                    f"\n  - Warmup: {lazy_warmup_steps} steps (vs {args.warmup_steps} for base)"
-                    f"\n  - Total: {lazy_total_steps} steps (vs {args.max_steps} for base)"
-                    f"\n  - Speed factor: {self.speed_factor}x faster",
+                    f"\n  - Warmup: {lazy_warmup_steps} steps ({self.warmup_multiplier}x base {args.warmup_steps})"
+                    f"\n  - Total: {lazy_total_steps} steps (1/{self.speed_factor} of {args.max_steps})",
                     flush=True
                 )
                 self.initialized = True
