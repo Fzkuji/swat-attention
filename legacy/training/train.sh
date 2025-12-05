@@ -42,6 +42,7 @@ echo "port:             ${port:=}"
 echo "nodes:            ${nodes:=1}"
 echo "gpus:             ${gpus:=8}"
 echo "freeze_lazy:      ${freeze_lazy:=0}"
+echo "freeze_lazy_ckpt: ${freeze_lazy_ckpt:=}"
 echo "monitor_lazy:     ${monitor_lazy:=0}"
 echo "lazy_lr_mult:     ${lazy_lr_mult:=10.0}"
 echo "dynamic_lazy_lr:  ${dynamic_lazy_lr:=false}"
@@ -100,7 +101,11 @@ if [ "$WANDB_DISABLED" != "true" ]; then
 else
   params+=" --report_to none"
 fi
-if [ $freeze_lazy -gt 0 ]; then
+if [ "$freeze_lazy_ckpt" != "" ]; then
+  # Load bias/tau from checkpoint and freeze (no training)
+  params+=" --freeze_lazy_from_checkpoint $freeze_lazy_ckpt"
+elif [ $freeze_lazy -gt 0 ]; then
+  # Freeze bias/tau after N steps
   params+=" --freeze_lazy_params_after $freeze_lazy"
 fi
 if [ $monitor_lazy -gt 0 ]; then
