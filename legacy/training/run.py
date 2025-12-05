@@ -163,35 +163,51 @@ def main():
             min_mult=min_mult,
         ))
 
-    # Get lazy_lr_multiplier from args (default 10x)
-    lazy_lr_multiplier = getattr(args, 'lazy_lr_multiplier', 10.0)
-    logger.info(f"Using LazyParamTrainer with lazy_lr_multiplier={lazy_lr_multiplier}x")
-
     # Load pretrained lazy params and freeze if specified
+    lazy_params_frozen = False
     if args.freeze_lazy_from_checkpoint:
         logger.info(f"Loading and freezing lazy params from {args.freeze_lazy_from_checkpoint}")
         load_and_freeze_lazy_params(model, args.freeze_lazy_from_checkpoint)
+        lazy_params_frozen = True
+        logger.info("Lazy params are FROZEN - using standard Trainer (no lazy param scheduling)")
 
-    # Fast cosine schedule for lazy params with auto-freeze
-    logger.info(f"Adding FastCosineSchedulerCallback with warmup_mult={args.lazy_warmup_multiplier}, total_mult={args.lazy_total_steps_multiplier}")
-    callbacks.append(FastCosineSchedulerCallback(
-        lr_multiplier=lazy_lr_multiplier,
-        min_lr_ratio=0.1,
-        warmup_multiplier=args.lazy_warmup_multiplier,
-        total_steps_multiplier=args.lazy_total_steps_multiplier,
-        delayed_start_multiplier=args.lazy_delayed_start_multiplier,
-        auto_freeze=True,
-    ))
+    # Get lazy_lr_multiplier from args (default 10x)
+    lazy_lr_multiplier = getattr(args, 'lazy_lr_multiplier', 10.0)
 
-    trainer = LazyParamTrainer(
-        lazy_lr_multiplier=lazy_lr_multiplier,
-        model=model,
-        args=args,
-        processing_class=tokenizer,
-        data_collator=data_collator,
-        callbacks=callbacks,
-        train_dataset=dataset
-    )
+    if lazy_params_frozen:
+        # Use standard Trainer when lazy params are frozen from checkpoint
+        trainer = Trainer(
+            model=model,
+            args=args,
+            processing_class=tokenizer,
+            data_collator=data_collator,
+            callbacks=callbacks,
+            train_dataset=dataset
+        )
+    else:
+        # Use LazyParamTrainer with separate LR schedule for lazy params
+        logger.info(f"Using LazyParamTrainer with lazy_lr_multiplier={lazy_lr_multiplier}x")
+
+        # Fast cosine schedule for lazy params with auto-freeze
+        logger.info(f"Adding FastCosineSchedulerCallback with warmup_mult={args.lazy_warmup_multiplier}, total_mult={args.lazy_total_steps_multiplier}")
+        callbacks.append(FastCosineSchedulerCallback(
+            lr_multiplier=lazy_lr_multiplier,
+            min_lr_ratio=0.1,
+            warmup_multiplier=args.lazy_warmup_multiplier,
+            total_steps_multiplier=args.lazy_total_steps_multiplier,
+            delayed_start_multiplier=args.lazy_delayed_start_multiplier,
+            auto_freeze=True,
+        ))
+
+        trainer = LazyParamTrainer(
+            lazy_lr_multiplier=lazy_lr_multiplier,
+            model=model,
+            args=args,
+            processing_class=tokenizer,
+            data_collator=data_collator,
+            callbacks=callbacks,
+            train_dataset=dataset
+        )
 
     # Reorder callbacks: LossCorrectionCallback must run BEFORE all callbacks that use logs
     # including ProgressCallback (console output), LogCallback, and WandbCallback
