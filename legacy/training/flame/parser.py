@@ -1,4 +1,64 @@
 # -*- coding: utf-8 -*-
+"""
+Training arguments for SWAT/Lazy Attention models.
+
+Lazy Attention Parameters (bias/tau) Training:
+==============================================
+
+These parameters control how bias and tau are trained:
+
+1. --lazy_lr_multiplier (default: 10.0)
+   Peak LR for lazy params = base_lr * this
+   Example: base_lr=1e-4, multiplier=10 -> lazy peak LR = 1e-3
+
+2. --lazy_warmup_multiplier (default: 2.0)
+   lazy_warmup_steps = base_warmup_steps * this
+   Example: warmup=512, multiplier=2 -> lazy warmup = 1024 steps
+
+3. --lazy_total_steps_multiplier (default: 2.0)
+   lazy_total_steps = lazy_warmup_steps * this
+   After this step, bias/tau are FROZEN (no more training)
+   Example: lazy_warmup=1024, multiplier=2 -> freeze at step 2048
+
+   Special values:
+   - Set to 0: Freeze immediately from step 0 (no training at all)
+
+4. --freeze_lazy_from_checkpoint (default: None)
+   Load bias/tau from a pretrained checkpoint and freeze immediately.
+   Useful for reusing learned lazy params without further training.
+   Example: --freeze_lazy_from_checkpoint /path/to/checkpoint-2048
+
+5. --monitor_lazy_params_every (default: None)
+   Print bias/tau statistics every N steps to monitor convergence.
+   Example: --monitor_lazy_params_every 100
+
+6. --lazy_delayed_start_multiplier (default: 0)
+   Delayed start mode: freeze lazy params initially, start training at warmup * this.
+   When > 0, enables delayed constant mode (instead of cosine mode):
+   - Steps 0 to (warmup * this - 1): params FROZEN (fast backward, skips atomic_add)
+   - Steps (warmup * this) onwards: UNFREEZE, constant LR = base_lr * lr_multiplier
+   - No auto-freeze, train until end
+   Example: --lazy_delayed_start_multiplier 4 (with warmup=512 -> freeze 0-2047, train 2048+)
+
+Example Commands:
+-----------------
+
+# Normal training (lazy params trained for 4x warmup steps, then frozen)
+python run.py --warmup_steps 512
+
+# No lazy param training (freeze immediately)
+python run.py --lazy_total_steps_multiplier 0
+
+# Load pretrained lazy params and freeze
+python run.py --freeze_lazy_from_checkpoint /path/to/checkpoint-2048
+
+# Custom schedule: slower warmup (3x), longer training (3x warmup = 9x base warmup)
+python run.py --lazy_warmup_multiplier 3.0 --lazy_total_steps_multiplier 3.0
+
+# Delayed start: freeze first 4x warmup steps, then constant LR until end
+# (optimizes early training speed via fast backward)
+python run.py --lazy_delayed_start_multiplier 4.0 --lazy_lr_multiplier 10.0
+"""
 
 from __future__ import annotations
 
@@ -15,6 +75,7 @@ logger = get_logger(__name__)
 
 @dataclass
 class TrainingArguments(TrainingArguments):
+    """Extended TrainingArguments with lazy attention parameter controls."""
 
     model_name_or_path: str = field(
         default=None,
@@ -94,8 +155,40 @@ class TrainingArguments(TrainingArguments):
         default=10.0,
         metadata={
             "help": "Learning rate multiplier for bias/tau parameters. "
-                    "Default 10x means lazy params use 10x higher max LR than other params. "
-                    "Combined with TAU_SCALE=100 for gradient amplification in bf16."
+                    "Default 10x means lazy params use 10x higher max LR than other params."
+        },
+    )
+    lazy_warmup_multiplier: float = field(
+        default=2.0,
+        metadata={
+            "help": "Warmup multiplier for lazy params. "
+                    "lazy_warmup = base_warmup * this. Default 2x means slower warmup."
+        },
+    )
+    lazy_total_steps_multiplier: float = field(
+        default=2.0,
+        metadata={
+            "help": "Total steps multiplier for lazy params (relative to lazy_warmup). "
+                    "lazy_total = lazy_warmup * this. After this, params are frozen. "
+                    "Set to 0 to freeze immediately from start (no training). "
+                    "Example: warmup=512, warmup_mult=2, total_mult=2 -> freeze at step 2048."
+        },
+    )
+    lazy_delayed_start_multiplier: float = field(
+        default=0.0,
+        metadata={
+            "help": "Delayed start mode: freeze lazy params initially, start training at warmup * this. "
+                    "Set to 0 for cosine mode (default). Set to 4.0 to start training at 4x warmup steps. "
+                    "After start, uses constant max LR (lr_multiplier * base_lr) until training ends. "
+                    "Early steps are optimized (frozen = fast backward, skips atomic_add). "
+                    "Example: warmup=512, delayed=4 -> frozen 0-2047, train 2048+ with constant 10x LR."
+        },
+    )
+    freeze_lazy_from_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to checkpoint to load bias/tau from, then freeze immediately. "
+                    "Use this to reuse pretrained lazy params without further training."
         },
     )
     dynamic_lazy_lr: bool = field(

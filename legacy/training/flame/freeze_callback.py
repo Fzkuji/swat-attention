@@ -3,6 +3,7 @@
 Callbacks for lazy attention parameter management:
 1. FreezeLazyParamsCallback - freeze bias/tau after N steps
 2. MonitorLazyParamsCallback - track parameter convergence
+3. load_and_freeze_lazy_params - load pretrained bias/tau and freeze
 """
 
 import torch
@@ -12,6 +13,78 @@ from transformers.training_args import TrainingArguments
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
+
+
+def load_and_freeze_lazy_params(model, source, verbose=True):
+    """
+    Load bias and tau from a pretrained source and freeze them.
+
+    Args:
+        model: Target model to load params into
+        source: Can be:
+            - str: Path to checkpoint directory or model file
+            - dict: State dict containing bias/tau params
+            - nn.Module: Another model to copy params from
+        verbose: Print loading info
+
+    Usage:
+        # From checkpoint
+        load_and_freeze_lazy_params(model, "/path/to/checkpoint-1000")
+
+        # From another model
+        load_and_freeze_lazy_params(model, pretrained_model)
+
+        # From state dict
+        state_dict = torch.load("model.pt")
+        load_and_freeze_lazy_params(model, state_dict)
+    """
+    import os
+
+    # Get source state dict
+    if isinstance(source, str):
+        # Path to checkpoint
+        if os.path.isdir(source):
+            # HuggingFace checkpoint directory
+            model_path = os.path.join(source, "pytorch_model.bin")
+            if not os.path.exists(model_path):
+                model_path = os.path.join(source, "model.safetensors")
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"No model file found in {source}")
+        else:
+            model_path = source
+
+        if model_path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            source_state = load_file(model_path)
+        else:
+            source_state = torch.load(model_path, map_location="cpu")
+    elif isinstance(source, dict):
+        source_state = source
+    elif hasattr(source, "state_dict"):
+        source_state = source.state_dict()
+    else:
+        raise TypeError(f"Unknown source type: {type(source)}")
+
+    # Find and load lazy params
+    loaded_count = 0
+    frozen_count = 0
+    target_state = model.state_dict()
+
+    for name, param in model.named_parameters():
+        if "learnable_bias_diagonals" in name or "tau" in name:
+            if name in source_state:
+                # Load the parameter
+                param.data.copy_(source_state[name])
+                loaded_count += 1
+
+            # Freeze it
+            param.requires_grad = False
+            frozen_count += 1
+
+    if verbose:
+        print(f"[load_and_freeze_lazy_params] Loaded {loaded_count} params, frozen {frozen_count} params")
+
+    return loaded_count, frozen_count
 
 
 def _is_main_process():
@@ -473,37 +546,56 @@ class DynamicLazyLRCallback(TrainerCallback):
 
 class FastCosineSchedulerCallback(TrainerCallback):
     """
-    Apply a faster cosine LR schedule to lazy params (bias/tau).
+    Apply a custom LR schedule to lazy params (bias/tau).
 
-    While base params follow the normal cosine schedule over max_steps,
-    lazy params follow a compressed cosine schedule that completes in
-    (max_steps / speed_factor) steps.
+    Supports two modes:
 
-    Example with speed_factor=10, warmup_multiplier=2:
-        - Base params: warmup 512 steps, cosine decay over 10000 steps
-        - Lazy params: warmup 1024 steps (2x longer!), cosine decay over 1000 steps
+    Mode 1: Fast Cosine with Auto-Freeze (delayed_start_multiplier=0)
+    ---------------------------------------------------------------
+    Lazy params follow a compressed schedule based on warmup steps:
+    - Warmup: base_warmup * warmup_multiplier (default 2x)
+    - Total: lazy_warmup * total_steps_multiplier (default 2x, so 4x base_warmup)
+    - After total steps: auto-freeze params (no more training)
 
-    This allows lazy params to:
-    1. Learn more slowly at the beginning (longer warmup)
-    2. Stabilize faster (cosine completes in 1/10 of training)
-    3. Be frozen once their schedule completes
+    Mode 2: Delayed Constant LR (delayed_start_multiplier > 0)
+    ----------------------------------------------------------
+    - Before start: params FROZEN (requires_grad=False) for fast backward
+    - Start step: base_warmup * delayed_start_multiplier
+    - After start: UNFREEZE and use constant max LR until training ends
+    - No auto-freeze, train until end
+
+    Example Mode 2 with base warmup=512, delayed_start_multiplier=4, lr_multiplier=10:
+        - Steps 0-2047: bias/tau FROZEN (fast backward, skips atomic_add)
+        - Steps 2048+: UNFREEZE, constant LR = base_lr * 10
+
+    This mode is useful when:
+    1. Early training of lazy params hurts overall convergence
+    2. You want to optimize compute in early steps (frozen = fast backward)
+    3. You want constant LR without decay for lazy params
     """
 
     def __init__(
         self,
-        speed_factor: float = 10.0,  # How much faster lazy params train (total steps)
         lr_multiplier: float = 10.0,  # Peak LR multiplier for lazy params
-        min_lr_ratio: float = 0.1,    # min_lr = max_lr * min_lr_ratio
-        warmup_multiplier: float = 2.0,  # Lazy warmup = base warmup * this
+        min_lr_ratio: float = 0.1,    # min_lr = max_lr * min_lr_ratio (only for cosine mode)
+        warmup_multiplier: float = 2.0,  # Lazy warmup = base warmup * this (cosine mode)
+        total_steps_multiplier: float = 2.0,  # Lazy total = lazy_warmup * this (cosine mode)
+        auto_freeze: bool = True,  # Auto-freeze params after total_steps (cosine mode)
+        delayed_start_multiplier: float = 0.0,  # Start training at base_warmup * this (0 = cosine mode)
         verbose: bool = True,
     ):
-        self.speed_factor = speed_factor
         self.lr_multiplier = lr_multiplier
         self.min_lr_ratio = min_lr_ratio
         self.warmup_multiplier = warmup_multiplier
+        self.total_steps_multiplier = total_steps_multiplier
+        self.auto_freeze = auto_freeze
+        self.delayed_start_multiplier = delayed_start_multiplier
         self.verbose = verbose
         self.lazy_param_group_idx = None
         self.initialized = False
+        self.frozen = False  # For cosine mode auto-freeze
+        self.started = False  # For delayed mode - whether training has started
+        self.initially_frozen = False  # For delayed mode - whether we froze at init
         self.last_logged_step = -100
 
     def _find_lazy_param_group(self, optimizer):
@@ -527,14 +619,39 @@ class FastCosineSchedulerCallback(TrainerCallback):
             progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
             return min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
 
+    def _freeze_lazy_params(self, model):
+        """Freeze learnable_bias_diagonals and tau in all layers."""
+        frozen_count = 0
+        for name, module in model.named_modules():
+            if hasattr(module, 'learnable_bias_diagonals'):
+                module.learnable_bias_diagonals.requires_grad = False
+                frozen_count += 1
+            if hasattr(module, 'tau'):
+                module.tau.requires_grad = False
+                frozen_count += 1
+        return frozen_count
+
+    def _unfreeze_lazy_params(self, model):
+        """Unfreeze learnable_bias_diagonals and tau in all layers."""
+        unfrozen_count = 0
+        for name, module in model.named_modules():
+            if hasattr(module, 'learnable_bias_diagonals'):
+                module.learnable_bias_diagonals.requires_grad = True
+                unfrozen_count += 1
+            if hasattr(module, 'tau'):
+                module.tau.requires_grad = True
+                unfrozen_count += 1
+        return unfrozen_count
+
     def on_step_begin(
         self,
         args,
         state,
         control,
+        model=None,
         **kwargs
     ):
-        """Update lazy LR at each step according to faster cosine schedule."""
+        """Update lazy LR at each step according to schedule mode."""
         optimizer = kwargs.get('optimizer', None)
         if optimizer is None:
             return
@@ -546,15 +663,94 @@ class FastCosineSchedulerCallback(TrainerCallback):
         if self.lazy_param_group_idx is None:
             return
 
-        # Compute lazy schedule parameters
-        # - warmup: 2x longer than base (slower start)
-        # - total: compressed by speed_factor (faster finish)
         base_lr = args.learning_rate
         lazy_max_lr = base_lr * self.lr_multiplier
-        lazy_min_lr = lazy_max_lr * self.min_lr_ratio
 
+        # ============================================================
+        # Mode 2: Delayed Constant LR
+        # ============================================================
+        if self.delayed_start_multiplier > 0:
+            start_step = int(args.warmup_steps * self.delayed_start_multiplier)
+
+            # Initialize: freeze params at the very beginning for fast backward
+            if not self.initialized:
+                if model is not None:
+                    unwrapped = _unwrap_model(model)
+                    frozen_count = self._freeze_lazy_params(unwrapped)
+                    self.initially_frozen = True
+                    if self.verbose and _is_main_process():
+                        print(
+                            f"\n[FastCosineScheduler] DELAYED MODE:"
+                            f"\n  - Lazy params FROZEN for steps 0-{start_step-1} (fast backward)"
+                            f"\n  - At step {start_step}: UNFREEZE, constant LR = {lazy_max_lr:.2e} ({self.lr_multiplier}x base)"
+                            f"\n  - Train until end (no auto-freeze)",
+                            flush=True
+                        )
+                # Set LR to 0 while frozen
+                optimizer.param_groups[self.lazy_param_group_idx]['lr'] = 0.0
+                self.initialized = True
+
+            # Check if it's time to unfreeze and start training
+            if not self.started and state.global_step >= start_step:
+                if model is not None:
+                    unwrapped = _unwrap_model(model)
+                    unfrozen_count = self._unfreeze_lazy_params(unwrapped)
+                    self.started = True
+                    if self.verbose and _is_main_process():
+                        print(
+                            f"\n[FastCosineScheduler] Step {state.global_step}: "
+                            f"UNFROZE {unfrozen_count} lazy params (bias/tau). "
+                            f"Starting training with constant LR = {lazy_max_lr:.2e}",
+                            flush=True
+                        )
+
+            # Set LR based on whether training has started
+            if self.started:
+                # Constant max LR after start
+                optimizer.param_groups[self.lazy_param_group_idx]['lr'] = lazy_max_lr
+            else:
+                # LR = 0 before start (params are frozen anyway)
+                optimizer.param_groups[self.lazy_param_group_idx]['lr'] = 0.0
+
+            # Log occasionally
+            if self.verbose and _is_main_process() and self.started:
+                if state.global_step - self.last_logged_step >= 500:
+                    base_lr_current = optimizer.param_groups[0]['lr']
+                    print(
+                        f"\n[FastCosineScheduler] Step {state.global_step}: "
+                        f"base_lr={base_lr_current:.2e}, lazy_lr={lazy_max_lr:.2e} (constant)",
+                        flush=True
+                    )
+                    self.last_logged_step = state.global_step
+            return
+
+        # ============================================================
+        # Mode 1: Fast Cosine with Auto-Freeze (original behavior)
+        # ============================================================
+        # Skip if already frozen
+        if self.frozen:
+            return
+
+        lazy_min_lr = lazy_max_lr * self.min_lr_ratio
         lazy_warmup_steps = int(args.warmup_steps * self.warmup_multiplier)
-        lazy_total_steps = int(args.max_steps / self.speed_factor)
+        lazy_total_steps = int(lazy_warmup_steps * self.total_steps_multiplier)
+
+        # Auto-freeze after total_steps
+        if self.auto_freeze and state.global_step >= lazy_total_steps:
+            if model is not None:
+                unwrapped = _unwrap_model(model)
+                frozen_count = self._freeze_lazy_params(unwrapped)
+                self.frozen = True
+                # Set LR to 0 for lazy param group
+                optimizer.param_groups[self.lazy_param_group_idx]['lr'] = 0.0
+                if self.verbose and _is_main_process():
+                    print(
+                        f"\n[FastCosineScheduler] Step {state.global_step}: "
+                        f"AUTO-FROZEN {frozen_count} lazy params (bias/tau). "
+                        f"No more gradient updates for these params.",
+                        flush=True
+                    )
+            return
 
         # Compute lazy LR using faster cosine schedule
         lazy_lr = self._cosine_schedule(
@@ -572,11 +768,11 @@ class FastCosineSchedulerCallback(TrainerCallback):
         if self.verbose and _is_main_process():
             if not self.initialized:
                 print(
-                    f"\n[FastCosineScheduler] Lazy params schedule:"
+                    f"\n[FastCosineScheduler] COSINE MODE:"
                     f"\n  - Peak LR: {lazy_max_lr:.2e} ({self.lr_multiplier}x base)"
                     f"\n  - Min LR: {lazy_min_lr:.2e}"
                     f"\n  - Warmup: {lazy_warmup_steps} steps ({self.warmup_multiplier}x base {args.warmup_steps})"
-                    f"\n  - Total: {lazy_total_steps} steps (1/{self.speed_factor} of {args.max_steps})",
+                    f"\n  - Total: {lazy_total_steps} steps ({self.total_steps_multiplier}x warmup, then FREEZE)",
                     flush=True
                 )
                 self.initialized = True
