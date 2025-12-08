@@ -47,6 +47,7 @@ echo "monitor_lazy:     ${monitor_lazy:=0}"
 echo "lazy_lr_mult:     ${lazy_lr_mult:=10.0}"
 echo "dynamic_lazy_lr:  ${dynamic_lazy_lr:=false}"
 echo "min_mult:         ${min_mult:=1.0}"
+echo "lazy_delayed:     ${lazy_delayed:=0}"
 
 params="--model_name_or_path $model \
     --tokenizer $tokenizer \
@@ -117,6 +118,11 @@ fi
 
 # Always pass lazy_lr_multiplier (default 10x)
 params+=" --lazy_lr_multiplier $lazy_lr_mult"
+
+# Delayed start for lazy params (freeze first, then train)
+if [ "$lazy_delayed" != "0" ]; then
+  params+=" --lazy_delayed_start_multiplier $lazy_delayed"
+fi
 
 echo "Launching training..."
 accelerate_params=""
